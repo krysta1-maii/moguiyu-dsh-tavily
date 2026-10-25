@@ -1,0 +1,3 @@
+- insert:
+  - id: dsh-tavily
+    name: '@moguiyu/dsh-tavily'
