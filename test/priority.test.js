@@ -1,10 +1,9 @@
 /**
- * Regression tests for the tool-level key rotation.
+ * Tests for the priority order of the Tavily key list.
  *
- * The failure these cover: a key that answers 432 (plan limit) or 433 (paygo
- * limit) was fatal, so the call threw before reaching a healthy key. And an
- * error that threw out of an attempt left the shared cursor parked on the
- * failing key, so every later call started on that same key.
+ * Every call starts at the first key. Only 401/429/432/433 move the call on to
+ * the next key; a healthy first key serves every call, and a non-key error ends
+ * the call instead of silently demoting the top key.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -67,14 +66,14 @@ async function withFetch(handler, run) {
 }
 
 for (const status of [401, 429, 432, 433]) {
-  test(`HTTP ${status} on the first key rotates to the next key in the same call`, async () => {
+  test(`HTTP ${status} on the first key falls through to the next key`, async () => {
     const keys = KEYS.slice(0, 2)
     const { dispose, tool } = install(keys)
     try {
       await withFetch(
         (key) => (key === keys[0] ? new Response('', { status }) : okResponse()),
         async (seen) => {
-          const result = await tool.execute({ query: 'rotation' }, {})
+          const result = await tool.execute({ query: 'priority' }, {})
           assert.deepEqual(seen, [keys[0], keys[1]])
           assert.equal(result.results.length, 1)
         },
@@ -85,7 +84,22 @@ for (const status of [401, 429, 432, 433]) {
   })
 }
 
-test('a quota-dead key costs one attempt per call, never the whole call', async () => {
+test('a healthy first key serves every call', async () => {
+  const keys = KEYS.slice(0, 3)
+  const { dispose, tool } = install(keys)
+  try {
+    await withFetch(() => okResponse(), async (seen) => {
+      await tool.execute({ query: 'a' }, {})
+      await tool.execute({ query: 'b' }, {})
+      await tool.execute({ query: 'c' }, {})
+      assert.deepEqual(seen, [keys[0], keys[0], keys[0]])
+    })
+  } finally {
+    dispose()
+  }
+})
+
+test('a quota-dead first key costs one attempt per call', async () => {
   const keys = KEYS.slice(0, 2)
   const { dispose, tool } = install(keys)
   try {
@@ -95,6 +109,31 @@ test('a quota-dead key costs one attempt per call, never the whole call', async 
         await tool.execute({ query: 'first' }, {})
         await tool.execute({ query: 'second' }, {})
         assert.deepEqual(seen, [keys[0], keys[1], keys[0], keys[1]])
+      },
+    )
+  } finally {
+    dispose()
+  }
+})
+
+test('keys are tried in order, and the next call starts at the top again', async () => {
+  const keys = KEYS.slice(0, 3)
+  const { dispose, tool } = install(keys)
+  let firstCall = true
+  try {
+    await withFetch(
+      (key) => {
+        if (!firstCall) return okResponse()
+        if (key === keys[0]) return new Response('', { status: 432 })
+        if (key === keys[1]) return new Response('', { status: 429 })
+        return okResponse()
+      },
+      async (seen) => {
+        await tool.execute({ query: 'first' }, {})
+        assert.deepEqual(seen, keys)
+        firstCall = false
+        await tool.execute({ query: 'second' }, {})
+        assert.deepEqual(seen, [keys[0], keys[1], keys[2], keys[0]])
       },
     )
   } finally {
@@ -118,7 +157,7 @@ test('all keys on quota fail once each and report the last status', async () => 
   }
 })
 
-test('an error that throws still moves the cursor past the failing key', async () => {
+test('a 500 on the first key ends the call without trying the next key', async () => {
   const keys = KEYS.slice(0, 2)
   const { dispose, tool } = install(keys)
   try {
@@ -127,27 +166,10 @@ test('an error that throws still moves the cursor past the failing key', async (
       async (seen) => {
         await assert.rejects(tool.execute({ query: 'first' }, {}), /HTTP 500/)
         assert.deepEqual(seen, [keys[0]])
-        // The cursor moved past the 500 key, so the next call reaches the
-        // healthy key instead of failing on the same one again.
-        await tool.execute({ query: 'second' }, {})
-        assert.deepEqual(seen, [keys[0], keys[1]])
+        await assert.rejects(tool.execute({ query: 'second' }, {}), /HTTP 500/)
+        assert.deepEqual(seen, [keys[0], keys[0]])
       },
     )
-  } finally {
-    dispose()
-  }
-})
-
-test('rotation wraps over three keys in order', async () => {
-  const keys = KEYS.slice(0, 3)
-  const { dispose, tool } = install(keys)
-  try {
-    await withFetch(() => okResponse(), async (seen) => {
-      await tool.execute({ query: 'a' }, {})
-      await tool.execute({ query: 'b' }, {})
-      await tool.execute({ query: 'c' }, {})
-      assert.deepEqual(seen, [keys[0], keys[1], keys[2]])
-    })
   } finally {
     dispose()
   }

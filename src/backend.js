@@ -11,7 +11,7 @@
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
-import { STRATEGIES, isValidStrategy, maskValue, parseKeyList, orderKeys, readJsonFile } from './lib.js'
+import { maskValue, parseKeyList, readJsonFile, reorderByMask } from './lib.js'
 
 const USAGE_TTL_MS = 60000
 const usageCache = new Map()
@@ -87,15 +87,6 @@ async function fetchUsageDetailsFor(key) {
   } catch {
     return null
   }
-}
-
-async function fetchUsageFor(key) {
-  const details = await fetchUsageDetailsFor(key)
-  if (details === null) return null
-  if (details.planLimit !== null && details.planLimit > 0 && details.planUsage !== null) {
-    return (details.planUsage / details.planLimit) * 100
-  }
-  return details.usage !== null ? details.usage : details.planUsage
 }
 
 /** Resolve one credential ref to its string value, or `null` when absent. */
@@ -202,18 +193,12 @@ export function installBackend(ctx) {
         }
       }
     }
-    const primaryMasked = keys.length > 0 ? maskValue(keys[0]) : null
     const display = keys.map((value) => {
       const masked = maskValue(value)
       return {
         masked,
         savedAt: keySavedAt[masked] !== undefined ? keySavedAt[masked] : null,
       }
-    }).sort((a, b) => {
-      if (a.savedAt === b.savedAt) return 0
-      if (a.savedAt === null) return 1
-      if (b.savedAt === null) return -1
-      return a.savedAt < b.savedAt ? -1 : 1
     })
     // The card needs to know what it may change. A ref inherited from the
     // launching environment is read-only, and saying so beats a raw 500 from
@@ -222,13 +207,12 @@ export function installBackend(ctx) {
     const primaryWritable = credentials === undefined ? true : await refWritable(credentials, 'TAVILY_API_KEY')
     const removable = source === 'list' ? keysWritable : primaryWritable
     return {
-      keys: display.map((entry) => ({
+      keys: display.map((entry, index) => ({
         masked: entry.masked,
         savedAt: entry.savedAt,
-        primary: entry.masked === primaryMasked,
+        primary: index === 0,
         removable,
       })),
-      strategy: isValidStrategy(state.strategy) ? state.strategy : 'rotate',
       source,
       writable: { keys: keysWritable, primary: primaryWritable },
     }
@@ -242,18 +226,8 @@ export function installBackend(ctx) {
       try {
         const { values: keys } = await collectStoredKeys(credentials)
         if (keys.length === 0) return send(res, 200, { ok: false, error: 'no Tavily API key configured' })
-        const state = readState(MANAGER_STATE)
-        const keySavedAt = state.keySavedAt !== undefined && typeof state.keySavedAt === 'object' ? state.keySavedAt : {}
-        const orderedKeys = keys.slice().sort((a, b) => {
-          const am = keySavedAt[maskValue(a)] !== undefined ? keySavedAt[maskValue(a)] : null
-          const bm = keySavedAt[maskValue(b)] !== undefined ? keySavedAt[maskValue(b)] : null
-          if (am === bm) return 0
-          if (am === null) return 1
-          if (bm === null) return -1
-          return am < bm ? -1 : 1
-        })
         const perKey = []
-        for (const key of orderedKeys) {
+        for (const key of keys) {
           try {
             const usage = await fetchUsageDetailsFor(key)
             perKey.push(usage !== null
@@ -300,19 +274,28 @@ export function installBackend(ctx) {
         }
         if (req.method === 'POST') {
           const body = await readBody(req)
-          const strategy = isValidStrategy(body.strategy) ? body.strategy : 'rotate'
           const addValues = Array.isArray(body.add)
             ? body.add.map((item) => typeof item === 'string' ? item.trim() : '').filter((value) => value.length > 0)
             : []
           const removeMasked = Array.isArray(body.remove)
             ? body.remove.filter((item) => typeof item === 'string' && item.length > 0)
             : []
+          const orderMasked = Array.isArray(body.order)
+            ? body.order.filter((item) => typeof item === 'string' && item.length > 0)
+            : []
 
           let { values: stored, source } = await collectStoredKeys(credentials)
+          if (orderMasked.length > 0) {
+            const reordered = reorderByMask(stored, orderMasked)
+            if (reordered === null) {
+              return send(res, 409, { ok: false, error: 'order must list every current key exactly once, by its masked value' })
+            }
+            stored = reordered
+          }
           if (removeMasked.length > 0) {
             stored = stored.filter((key) => !removeMasked.includes(maskValue(key)))
           }
-          let values = [...stored]
+          const values = [...stored]
           for (const value of addValues) {
             if (!values.includes(value)) values.push(value)
           }
@@ -326,7 +309,7 @@ export function installBackend(ctx) {
           const canWritePrimary = await refWritable(credentials, 'TAVILY_API_KEY')
           const READONLY_LIST = 'TAVILY_API_KEYS is supplied read-only by the launching environment, so the key list cannot be changed here. Unset it in the shell you start dsh from, or manage keys in ~/.dsh/.credentials.yaml.'
           const READONLY_PRIMARY = 'That key comes from TAVILY_API_KEY, which the launching environment supplies read-only. Unset it in the shell you start dsh from.'
-          if (!canWriteList && (addValues.length > 0 || removeMasked.length > 0)) {
+          if (!canWriteList && (addValues.length > 0 || removeMasked.length > 0 || orderMasked.length > 0)) {
             return send(res, 409, { ok: false, error: READONLY_LIST })
           }
           if (!canWritePrimary && source === 'primary' && removeMasked.length > 0) {
@@ -343,14 +326,6 @@ export function installBackend(ctx) {
             await credentials.unset('TAVILY_API_KEYS')
             await syncPrimary(credentials, null)
           } else {
-            if (strategy !== 'rotate') {
-              const usageRows = await Promise.all(values.map(async (value) => ({ value, usage: await fetchUsageFor(value) })))
-              const usageOf = (value) => {
-                const row = usageRows.find((r) => r.value === value)
-                return row !== undefined && row.usage !== null ? row.usage : null
-              }
-              values = orderKeys(values, strategy, usageOf)
-            }
             await credentials.set('TAVILY_API_KEYS', values.join(','))
             await syncPrimary(credentials, values[0])
           }
@@ -362,7 +337,7 @@ export function installBackend(ctx) {
             const masked = maskValue(value)
             if (keySavedAt[masked] === undefined) keySavedAt[masked] = now
           }
-          writeState(MANAGER_STATE, { keySavedAt, strategy })
+          writeState(MANAGER_STATE, { keySavedAt })
 
           return send(res, 200, { ok: true, ...(await buildManagerPayload(values, source)) })
         }

@@ -10,12 +10,6 @@ export function factory(require) {
 
   const inject = ['slots']
 
-  const STRATEGIES = [
-    { id: 'rotate', label: 'Round-robin', hint: 'Use keys in turn; on HTTP 401/429/432/433 (invalid key, rate limit, or quota) the next key is tried automatically.' },
-    { id: 'low-usage-first', label: 'Lowest usage first', hint: 'Re-orders keys by current Tavily usage, least-used first. The first key becomes primary.' },
-    { id: 'high-usage-first', label: 'Highest usage first', hint: 'Re-orders keys by current Tavily usage, most-used first. The first key becomes primary.' }
-  ]
-
   const ICONS = {
     eye: ['M1.5 8C1.5 8 4 3.5 8 3.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Z', 'M8 5.8a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4Z'],
     eyeOff: ['M1.5 8C1.5 8 4 3.5 8 3.5c1.6 0 3 .5 4.1 1.2', 'M14.5 8C14.5 8 12 12.5 8 12.5c-1.6 0-3-.5-4.1-1.2', 'M2 2l12 12', 'M8 5.8a2.2 2.2 0 0 1 2.2 2.2'],
@@ -23,7 +17,9 @@ export function factory(require) {
     trash: ['M2.5 4h11', 'M6.2 4V2.8h3.6V4', 'M4.2 4l.7 9.2h6.2L11.8 4', 'M6.5 6.5v4.2', 'M9.5 6.5v4.2'],
     check: ['M3 8.5l3.5 3.5L13 5'],
     close: ['M4 4l8 8', 'M12 4l-8 8'],
-    restore: ['M8 3a5 5 0 1 0 4.9 4', 'M13.4 1.8V5H10']
+    restore: ['M8 3a5 5 0 1 0 4.9 4', 'M13.4 1.8V5H10'],
+    up: ['M8 13V3', 'M4 7l4-4 4 4'],
+    down: ['M8 3v10', 'M4 9l4 4 4-4']
   }
 
   const btn = { height: 28, borderRadius: 14, border: '1px solid var(--dsw-alias-border-l2)', background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)', padding: '0 10px', cursor: 'pointer', fontSize: 12 }
@@ -73,7 +69,6 @@ export function factory(require) {
   function TavilySettingsCard() {
     const [server, setServer] = react.useState(null)
     const [loadError, setLoadError] = react.useState(null)
-    const [strategy, setStrategy] = react.useState('rotate')
     const [removing, setRemoving] = react.useState({})
     const [replacing, setReplacing] = react.useState({})
     const [replaceDrafts, setReplaceDrafts] = react.useState({})
@@ -89,7 +84,7 @@ export function factory(require) {
       try {
         const response = await fetch('/api/tavily-manager', { cache: 'no-store' })
         const data = await response.json()
-        if (data.ok) { setServer(data); setStrategy(data.strategy) } else { setLoadError(data.error || 'Failed to load keys') }
+        if (data.ok) { setServer(data) } else { setLoadError(data.error || 'Failed to load keys') }
       } catch (error) {
         setLoadError(String(error && error.message ? error.message : error))
       }
@@ -105,18 +100,26 @@ export function factory(require) {
 
     react.useEffect(() => { refresh() }, [refresh])
 
-    const saveStrategy = async (next) => {
+    const moveKey = async (masked, delta) => {
+      if (server === null) return
+      const order = server.keys.map((entry) => entry.masked)
+      const from = order.indexOf(masked)
+      const to = from + delta
+      if (from < 0 || to < 0 || to >= order.length) return
+      const next = order.slice()
+      next[from] = order[to]
+      next[to] = order[from]
       setBusy(true)
       setNotice(null)
       try {
         const response = await fetch('/api/tavily-manager', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ add: [], remove: [], strategy: next })
+          body: JSON.stringify({ order: next })
         })
         const data = await response.json()
-        if (!data.ok) { setNotice({ error: data.error || 'Strategy save failed' }); return }
-        setNotice({ ok: 'Strategy saved — effective on the next search.' })
+        if (!data.ok) { setNotice({ error: data.error || 'Priority update failed' }); return }
+        setNotice({ ok: 'Priority updated.' })
         await refresh()
       } catch (error) {
         setNotice({ error: String(error && error.message ? error.message : error) })
@@ -134,7 +137,7 @@ export function factory(require) {
         const response = await fetch('/api/tavily-manager', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ add: [value], remove: [], strategy })
+          body: JSON.stringify({ add: [value], remove: [] })
         })
         const data = await response.json()
         if (!data.ok) { setNotice({ error: data.error || 'Save failed' }); return }
@@ -155,7 +158,7 @@ export function factory(require) {
         const response = await fetch('/api/tavily-manager', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ add: [], remove: [masked], strategy })
+          body: JSON.stringify({ add: [], remove: [masked] })
         })
         const data = await response.json()
         if (!data.ok) { setNotice({ error: data.error || 'Delete failed' }); return }
@@ -180,7 +183,7 @@ export function factory(require) {
         const response = await fetch('/api/tavily-manager', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ add: [value], remove: [masked], strategy })
+          body: JSON.stringify({ add: [value], remove: [masked] })
         })
         const data = await response.json()
         if (!data.ok) { setNotice({ error: data.error || 'Update failed' }); return }
@@ -244,6 +247,7 @@ export function factory(require) {
 
     const headStyle = { textAlign: 'left', padding: '6px 8px', borderBottom: '1px solid var(--dsw-alias-border-l2)', fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' }
     const cellStyle = { padding: '8px', verticalAlign: 'top' }
+    const keysReadOnly = server !== null && server.writable !== undefined && server.writable.keys === false
 
     // The Plugins page draws the title, the icon, and the crumb — the
     // `plugins.bundle.config` contract puts the form alone in the entry — so
@@ -252,9 +256,9 @@ export function factory(require) {
       react.createElement('style', null, '.dts-icon-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}.dts-icon-btn:disabled{opacity:.4;cursor:default}.dts-icon-btn-danger:hover{background:var(--dsw-alias-interactive-bg-hover-danger)}'),
       react.createElement(react.Fragment, null,
               react.createElement('p', { style: { margin: 0, fontSize: 13, color: 'var(--dsw-alias-label-tertiary)' } },
-                'All keys are listed below; the green dot marks the first (primary) key. The tavily_search tool uses all keys according to the strategy. Built-in web_search is unaffected.'
+                'Keys are tried in the order shown, top first; the green dot marks the primary key. A key that returns 401/429/432/433 is skipped for that call and the next key is tried. Built-in web_search is unaffected.'
               ),
-              server !== null && server.writable !== undefined && server.writable.keys === false &&
+              keysReadOnly &&
                 react.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } },
                   'Read-only: these keys come from the environment that launched dsh, so this card cannot change them. Unset TAVILY_API_KEYS / TAVILY_API_KEY in that shell and restart dsh to manage keys here.'
                 ),
@@ -293,7 +297,7 @@ export function factory(require) {
                           : react.createElement('span', null,
                               isRevealed ? revealed[masked] : masked,
                               key.primary === true && !isRemoved && react.createElement('span', {
-                                title: 'Primary — the first key in the rotation',
+                                title: 'Primary — the first key tried',
                                 style: { display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: 'var(--dsw-alias-state-success-primary)', marginLeft: 8, verticalAlign: 'middle', flex: 'none' }
                               })
                             )
@@ -309,6 +313,8 @@ export function factory(require) {
                               react.createElement(IconButton, { icon: 'close', title: 'Cancel', onClick: () => cancelReplace(masked), disabled: busy })
                             )
                           : react.createElement('span', { style: { display: 'inline-flex', gap: 2 } },
+                              !isRemoved && react.createElement(IconButton, { icon: 'up', title: 'Move up (higher priority)', onClick: () => moveKey(masked, -1), disabled: busy || keysReadOnly || index === 0 }),
+                              !isRemoved && react.createElement(IconButton, { icon: 'down', title: 'Move down (lower priority)', onClick: () => moveKey(masked, 1), disabled: busy || keysReadOnly || index === server.keys.length - 1 }),
                               !isRemoved && react.createElement(IconButton, { icon: isRevealed ? 'eyeOff' : 'eye', title: isRevealed ? 'Hide key' : 'Show key', onClick: () => toggleReveal(masked), disabled: busy }),
                               !isRemoved && react.createElement(IconButton, { icon: 'pencil', title: 'Edit', onClick: () => startReplace(masked), disabled: busy }),
                               react.createElement(IconButton, {
@@ -350,23 +356,9 @@ export function factory(require) {
                 )
               ),
               react.createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
-                react.createElement('button', { type: 'button', style: btn, onClick: () => setAdds((current) => [...current, { id: 'add-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7), value: '' }]), disabled: busy }, '+ Add key'),
+                react.createElement('button', { type: 'button', style: btn, onClick: () => setAdds((current) => [...current, { id: 'add-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7), value: '' }]), disabled: busy || keysReadOnly }, '+ Add key'),
               ),
-              react.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-                react.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-                  react.createElement('label', { style: { fontWeight: 500, fontSize: 13 } }, 'Key usage strategy'),
-                  react.createElement('select', {
-                    style: { maxWidth: 280, height: 32, border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8, background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)', padding: '0 10px', fontSize: 13 },
-                    value: strategy,
-                    onChange: (event) => saveStrategy(event.target.value),
-                    disabled: busy
-                  }, STRATEGIES.map((option) => react.createElement('option', { key: option.id, value: option.id }, option.label))),
-                  notice !== null && react.createElement('span', { style: { fontSize: 13, color: notice.ok ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)' } }, notice.ok ? notice.ok : String(notice.error))
-                ),
-                react.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } },
-                  (STRATEGIES.find((option) => option.id === strategy) || STRATEGIES[0]).hint + ' Saved immediately when selected.'
-                )
-              ),
+              notice !== null && react.createElement('p', { style: { margin: 0, fontSize: 12, color: notice.ok ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-error-primary)' } }, notice.ok ? notice.ok : String(notice.error)),
               usageError !== null && react.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-state-error-primary)' } }, String(usageError)),
               usage !== null && usage.ok === false && react.createElement('p', { style: { margin: 0, fontSize: 12, color: 'var(--dsw-alias-state-error-primary)' } }, String(usage.error))
             )
@@ -380,7 +372,7 @@ export function factory(require) {
   // how the shipped cards (WebSearchCard and friends) are written.
   function TavilyCard(props) {
     if (props && props.view === 'summary') {
-      return 'Manage Tavily API keys and the key-usage strategy. The built-in web_search is never replaced.'
+      return 'Manage Tavily API keys and the order they are tried in. The built-in web_search is never replaced.'
     }
     return react.createElement(TavilySettingsCard, null)
   }

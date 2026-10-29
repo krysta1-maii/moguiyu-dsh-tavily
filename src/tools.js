@@ -2,7 +2,8 @@
  * Tool half of `@moguiyu/dsh-tavily`: the advanced `tavily_search` model tool
  * plus the extra Tavily direct tools (`tavily_extract`, `tavily_map`,
  * `tavily_crawl`). Keys resolve from `TAVILY_API_KEYS` per call, falling back
- * to `TAVILY_API_KEY`; rotation is round-robin with failover on 401/429/432/433.
+ * to `TAVILY_API_KEY`; keys are tried in list order, top first, with failover on
+ * 401/429/432/433.
  *
  * The tools are an OPTION for search, never a replacement: they are
  * independent of the built-in `web_search` provider, and registering them
@@ -439,8 +440,6 @@ const NAVIGATION_PARAMETERS = {
  * provider and `ctx.web` is never touched.
  */
 export function installTavilyTool(ctx) {
-  let rotation = 0
-
   // Every registration is collected into one disposer so the fiber tears the
   // half down cleanly: on row unload, and on the Plugins page's runtime unload
   // of the bundle (0.1.6-alpha.2 unloads without restarting anything).
@@ -467,28 +466,19 @@ export function installTavilyTool(ctx) {
     return { keys: [], source: 'unconfigured' }
   }
 
-  /** Run `body` through the rotation/failover loop; returns the response JSON. */
-  async function requestWithRotation(operation, body, timeoutMs, exec, detail) {
+  /**
+   * Run `body` through the key list in order. The list is the priority: every
+   * call starts at the first key, and only a 401/429/432/433 outcome moves on
+   * to the next one. Returns the response JSON.
+   */
+  async function requestWithFailover(operation, body, timeoutMs, exec, detail) {
     const { keys, source } = await resolveKeys()
     if (keys.length === 0) {
       throw new Error(`tavily_${operation}: TAVILY_API_KEYS or TAVILY_API_KEY is not configured — add it via the Tavily Search settings card or ~/.dsh/.credentials.yaml (comma-separated)`)
     }
-    const attempts = keys.length
-    // Snapshot this call's start: concurrent calls update rotation.
-    // Reading the shared cursor again inside the loop would skip keys or retry
-    // the same one.
-    const start = rotation % keys.length
     let lastStatus = 0
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      const index = (start + attempt) % keys.length
+    for (let index = 0; index < keys.length; index++) {
       const key = keys[index]
-      // Advance past this key BEFORE the attempt, so every outcome leaves the
-      // cursor on the next key: success, a retryable status, and an error the
-      // loop never sees because `callOperation` throws it (400, 5xx, a network
-      // failure, a timeout). Advancing only after an outcome parked the cursor
-      // on a key that fails by throwing, and every later call then failed on
-      // that same key without ever reaching the healthy ones.
-      rotation = (index + 1) % keys.length
       const started = Date.now()
       const outcome = await callOperation(operation, body, key, exec, timeoutMs)
       if (outcome.kind === 'ok') {
@@ -497,9 +487,9 @@ export function installTavilyTool(ctx) {
         return outcome.json
       }
       lastStatus = outcome.statusCode
-      ctx.logger.info(`tavily_${operation}: key %d/%d returned HTTP %d, rotating`, index + 1, keys.length, outcome.statusCode)
+      ctx.logger.info(`tavily_${operation}: key %d/%d returned HTTP %d`, index + 1, keys.length, outcome.statusCode)
     }
-    throw new Error(`tavily_${operation}: all ${attempts} configured key(s) failed with HTTP ${lastStatus} (invalid key, rate limit, or quota exhausted)`)
+    throw new Error(`tavily_${operation}: all ${keys.length} configured key(s) failed with HTTP ${lastStatus} (invalid key, rate limit, or quota exhausted)`)
   }
 
   tools.register(defineTool({
@@ -546,7 +536,7 @@ export function installTavilyTool(ctx) {
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const input = normalizeArgs(args)
-      const json = await requestWithRotation('search', buildBody(input), 30000, exec, (j) => ({
+      const json = await requestWithFailover('search', buildBody(input), 30000, exec, (j) => ({
         query: input.query,
         results: Array.isArray(j.results) ? j.results.length : 0,
       }))
@@ -569,7 +559,7 @@ export function installTavilyTool(ctx) {
     timeoutMs: 60000,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const json = await requestWithRotation('extract', buildExtractBody(normalizeExtractArgs(args)), 60000, exec)
+      const json = await requestWithFailover('extract', buildExtractBody(normalizeExtractArgs(args)), 60000, exec)
       return projectExtract(json)
     },
   }))
@@ -582,7 +572,7 @@ export function installTavilyTool(ctx) {
     timeoutMs: 60000,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const json = await requestWithRotation('map', buildNavBody(normalizeNavArgs(args, { crawl: false })), 60000, exec)
+      const json = await requestWithFailover('map', buildNavBody(normalizeNavArgs(args, { crawl: false })), 60000, exec)
       return projectMap(json)
     },
   }))
@@ -601,7 +591,7 @@ export function installTavilyTool(ctx) {
     timeoutMs: 120000,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const json = await requestWithRotation('crawl', buildNavBody(normalizeNavArgs(args, { crawl: true })), 120000, exec)
+      const json = await requestWithFailover('crawl', buildNavBody(normalizeNavArgs(args, { crawl: true })), 120000, exec)
       return projectCrawl(json)
     },
   }))

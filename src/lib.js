@@ -3,12 +3,6 @@
  */
 import { readFileSync } from 'node:fs'
 
-export const STRATEGIES = ['rotate', 'low-usage-first', 'high-usage-first']
-
-export function isValidStrategy(value) {
-  return STRATEGIES.includes(value)
-}
-
 /**
  * Mask a key for display: `first12…last4`; comma-separated lists are masked
  * per part. Never reveals more than a fingerprint.
@@ -38,20 +32,31 @@ export function parseKeyList(value) {
 }
 
 /**
- * Order keys according to a strategy. `usageOf(key)` returns a number or null
- * (unknown usage is treated as 0). `rotate` keeps the given order.
+ * Reorder `keys` by a permutation of their masked values.
+ *
+ * The card identifies keys by `maskValue`, so a move sends the new order as
+ * masked fingerprints. Returns `null` when the request is not a permutation of
+ * the current list, or when two keys share a fingerprint — the order cannot be
+ * applied without guessing which key is which.
  */
-export function orderKeys(values, strategy, usageOf) {
-  if (strategy === 'rotate') return [...values]
-  const usageOfKey = (value) => {
-    const usage = usageOf(value)
-    return usage !== null && typeof usage === 'number' ? usage : 0
+export function reorderByMask(keys, order) {
+  if (!Array.isArray(order) || order.length !== keys.length) return null
+  const byMask = new Map()
+  for (const key of keys) {
+    const masked = maskValue(key)
+    if (byMask.has(masked)) return null
+    byMask.set(masked, key)
   }
-  const sorted = [...values]
-  sorted.sort((a, b) => strategy === 'low-usage-first'
-    ? usageOfKey(a) - usageOfKey(b)
-    : usageOfKey(b) - usageOfKey(a))
-  return sorted
+  const seen = new Set()
+  const out = []
+  for (const masked of order) {
+    if (typeof masked !== 'string' || seen.has(masked)) return null
+    const key = byMask.get(masked)
+    if (key === undefined) return null
+    seen.add(masked)
+    out.push(key)
+  }
+  return out
 }
 
 /** Read a JSON object file; `fallback` on missing or unparsable content. */

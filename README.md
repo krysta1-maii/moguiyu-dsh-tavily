@@ -11,8 +11,9 @@ The bundle and plugin entries use the bundled Tavily color icon from
 - **`tavily_search`** — full Tavily surface (`max_results`, `search_depth`, `topic`, `days`,
   `include_answer`, `include_raw_content`, `include_domains`, `exclude_domains`).
 - **`tavily_extract` / `tavily_map` / `tavily_crawl`** — read a known URL's content, map a
-  site's links, or crawl a site and return its pages. Same key-rotation/failover as search.
-- **Card** — key list, usage gauge, and the strategy selector. It registers into the Plugins
+  site's links, or crawl a site and return its pages. Same priority order and failover as search.
+- **Card** — key list in priority order, usage gauge, and up/down controls. The top key is
+  called first and the rest are fallbacks. It registers into the Plugins
   page's `plugins.bundle.config` slot, keyed `@moguiyu/dsh-tavily`, and needs DSH
   **0.1.6-alpha.2 or newer** — the release that retired `settings.plugin.item` and moved plugin
   configuration off the Settings page. On older lines the tools and routes work; there is simply
@@ -35,17 +36,17 @@ page's own bundle toggle is the only on/off.
 
 ## DSH 0.2 compatibility
 
-Version **0.4.0** accepts the same DSH peers as 0.3.2 (`^0.2.0-0` and the
+Version **0.5.0** accepts the same DSH peers as 0.3.2 (`^0.2.0-0` and the
 earlier 0.1.x ranges). The 0.3.2 host regression baseline against **0.2.0-rc.2**
 — the compatibility gate, real tool execution, credential reads/writes and
-unload/reload — is unchanged by this release, which touches only the in-tool
-retry classification and rotation cursor. No version exemption is required.
+unload/reload — remains the baseline for this line. No version exemption is
+required.
 
 Set `TAVILY_API_KEYS` to a comma-separated list, or use `TAVILY_API_KEY` alone.
-The list takes precedence when non-empty, matching the management card. HTTP
-401/429/432/433 tries each distinct configured key at most once per call before
-reporting failure. 432 and 433 are Tavily's plan-limit and paygo-limit responses,
-so a key that has spent its allowance is skipped for the next key instead of
-failing the call.
+The list takes precedence when non-empty, matching the management card. The list
+order is the priority: every call starts at the first key, and a 401, 429, 432, or
+433 response moves that call on to the next key. Each distinct key is tried at
+most once per call. 432 and 433 are Tavily's plan-limit and paygo-limit responses,
+so a key that has spent its allowance is skipped instead of failing the call.
 
 See the [workspace README](../../README.md) for install and configuration.
