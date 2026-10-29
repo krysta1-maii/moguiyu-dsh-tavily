@@ -35,13 +35,17 @@ page's own bundle toggle is the only on/off.
 
 ## DSH 0.2 compatibility
 
-Version **0.3.2** accepts DSH peers `^0.2.0-0` and is regression-tested against
-**0.2.0-rc.2**, including the host's compatibility gate, real tool execution,
-credential reads/writes and unload/reload. No version exemption is required.
-The previously declared 0.1.x peer ranges remain available.
+Version **0.4.0** accepts the same DSH peers as 0.3.2 (`^0.2.0-0` and the
+earlier 0.1.x ranges). The 0.3.2 host regression baseline against **0.2.0-rc.2**
+— the compatibility gate, real tool execution, credential reads/writes and
+unload/reload — is unchanged by this release, which touches only the in-tool
+retry classification and rotation cursor. No version exemption is required.
 
 Set `TAVILY_API_KEYS` to a comma-separated list, or use `TAVILY_API_KEY` alone.
-The list takes precedence when non-empty, matching the management card. HTTP 401/429
-tries each distinct configured key at most once per call before reporting failure.
+The list takes precedence when non-empty, matching the management card. HTTP
+401/429/432/433 tries each distinct configured key at most once per call before
+reporting failure. 432 and 433 are Tavily's plan-limit and paygo-limit responses,
+so a key that has spent its allowance is skipped for the next key instead of
+failing the call.
 
 See the [workspace README](../../README.md) for install and configuration.

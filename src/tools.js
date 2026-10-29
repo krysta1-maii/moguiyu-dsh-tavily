@@ -2,7 +2,7 @@
  * Tool half of `@moguiyu/dsh-tavily`: the advanced `tavily_search` model tool
  * plus the extra Tavily direct tools (`tavily_extract`, `tavily_map`,
  * `tavily_crawl`). Keys resolve from `TAVILY_API_KEYS` per call, falling back
- * to `TAVILY_API_KEY`; rotation is round-robin with failover on 401/429.
+ * to `TAVILY_API_KEY`; rotation is round-robin with failover on 401/429/432/433.
  *
  * The tools are an OPTION for search, never a replacement: they are
  * independent of the built-in `web_search` provider, and registering them
@@ -19,6 +19,15 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parseKeyList } from './lib.js'
 
 const TAVILY_BASE_URL = 'https://api.tavily.com'
+
+/**
+ * Statuses that mean "this key cannot serve the request, the next one might":
+ * 401 invalid key, 429 rate limit, and Tavily's two quota responses — 432 plan
+ * limit exceeded and 433 paygo limit exceeded. The quota pair matters because a
+ * key that has spent its allowance answers every request with 432/433;
+ * treating those as fatal fails the call even when another key is healthy.
+ */
+const RETRYABLE_STATUSES = new Set([401, 429, 432, 433])
 
 /** Clamp a number into [min, max]; `fallback` when not finite. */
 export function clampInt(value, min, max, fallback) {
@@ -104,7 +113,7 @@ async function callOperation(operation, body, key, exec, timeoutMs) {
       body: JSON.stringify(body),
       signal: combined.signal,
     })
-    if (response.status === 401 || response.status === 429) {
+    if (RETRYABLE_STATUSES.has(response.status)) {
       return { kind: 'retryable', statusCode: response.status }
     }
     if (!response.ok) {
@@ -465,26 +474,32 @@ export function installTavilyTool(ctx) {
       throw new Error(`tavily_${operation}: TAVILY_API_KEYS or TAVILY_API_KEY is not configured — add it via the Tavily Search settings card or ~/.dsh/.credentials.yaml (comma-separated)`)
     }
     const attempts = keys.length
-    // Snapshot this call's start: retries and concurrent calls update rotation.
-    // Reading the shared cursor again would skip keys or retry the same one.
+    // Snapshot this call's start: concurrent calls update rotation.
+    // Reading the shared cursor again inside the loop would skip keys or retry
+    // the same one.
     const start = rotation % keys.length
-    let lastRetryable = 0
+    let lastStatus = 0
     for (let attempt = 0; attempt < attempts; attempt++) {
       const index = (start + attempt) % keys.length
       const key = keys[index]
+      // Advance past this key BEFORE the attempt, so every outcome leaves the
+      // cursor on the next key: success, a retryable status, and an error the
+      // loop never sees because `callOperation` throws it (400, 5xx, a network
+      // failure, a timeout). Advancing only after an outcome parked the cursor
+      // on a key that fails by throwing, and every later call then failed on
+      // that same key without ever reaching the healthy ones.
+      rotation = (index + 1) % keys.length
       const started = Date.now()
       const outcome = await callOperation(operation, body, key, exec, timeoutMs)
       if (outcome.kind === 'ok') {
-        rotation = (index + 1) % keys.length
         const extra = typeof detail === 'function' ? detail(outcome.json) : {}
         ctx.logger.info(`tavily_${operation}: ok %j`, { ...extra, status: outcome.statusCode, ms: Date.now() - started, keys: keys.length, source })
         return outcome.json
       }
-      lastRetryable = outcome.statusCode
-      rotation = (index + 1) % keys.length
+      lastStatus = outcome.statusCode
       ctx.logger.info(`tavily_${operation}: key %d/%d returned HTTP %d, rotating`, index + 1, keys.length, outcome.statusCode)
     }
-    throw new Error(`tavily_${operation}: all ${attempts} configured key(s) failed with HTTP ${lastRetryable} (invalid key or rate limit)`)
+    throw new Error(`tavily_${operation}: all ${attempts} configured key(s) failed with HTTP ${lastStatus} (invalid key, rate limit, or quota exhausted)`)
   }
 
   tools.register(defineTool({

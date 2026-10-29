@@ -11,7 +11,7 @@ export function factory(require) {
   const inject = ['slots']
 
   const STRATEGIES = [
-    { id: 'rotate', label: 'Round-robin', hint: 'Use keys in turn; on HTTP 401/429 the next key is tried automatically.' },
+    { id: 'rotate', label: 'Round-robin', hint: 'Use keys in turn; on HTTP 401/429/432/433 (invalid key, rate limit, or quota) the next key is tried automatically.' },
     { id: 'low-usage-first', label: 'Lowest usage first', hint: 'Re-orders keys by current Tavily usage, least-used first. The first key becomes primary.' },
     { id: 'high-usage-first', label: 'Highest usage first', hint: 'Re-orders keys by current Tavily usage, most-used first. The first key becomes primary.' }
   ]
