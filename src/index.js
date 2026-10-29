@@ -4,11 +4,13 @@
  * Both halves live here, so there is no cross-package contract left to skew:
  *
  * - the model tools (`tools.js`) — `tavily_search`, `tavily_extract`,
- *   `tavily_map`, `tavily_crawl`, with the configured key order as the priority and
- *   failover on 401/429/432/433;
+ *   `tavily_map`, `tavily_crawl`, with priority or round-robin selection,
+ *   per-key availability, and failover on 401/429/432/433;
  * - key and usage management (`backend.js`) — `/api/tavily-usage` and
- *   `/api/tavily-manager`;
- * - the browser card (`client.js`) — keys, usage, and priority order.
+ *   `/api/tavily-manager`, including the call mode and availability records;
+ * - shared routing state (`state.js`) — mode, manual/automatic availability, and
+ *   the memory-only round-robin cursor;
+ * - the browser card (`client.js`) — keys, usage, call order, and availability.
  *
  * Composing the plugin registers the tools. There is NO tool-level on/off:
  * the Plugins page's own bundle toggle is the only one. Two earlier designs

@@ -1,35 +1,46 @@
 /**
- * Routes half of `@moguiyu/dsh-tavily`: key and usage management on the
- * harness webServer (`/api/tavily-usage`, `/api/tavily-manager`). The
- * built-in `web_search` tool is never replaced — no web search provider is
- * registered and `web.searchProvider` is never touched.
+ * Routes half of `@moguiyu/dsh-tavily`: key, availability, and usage
+ * management on the harness webServer (`/api/tavily-usage`,
+ * `/api/tavily-manager`). The built-in `web_search` tool is never replaced —
+ * no web search provider is registered and `web.searchProvider` is never
+ * touched.
  *
- * There is no `/api/tavily-tool` switch route: the tool-level on/off is gone
- * (see `tools.js`). Key management is not a capability gate — it only edits
- * the credentials the tools read.
+ * The manager owns three pieces of state now: the credential list, the call
+ * mode (priority or round-robin), and a per-key availability record. The
+ * availability record is deliberately separate from the credential list, so a
+ * key can be turned off or quota-blocked without rewriting the list and
+ * without losing its position.
  */
-import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { maskValue, parseKeyList, readJsonFile, reorderByMask } from './lib.js'
+import {
+  MODE_PRIORITY,
+  MODE_ROUND_ROBIN,
+  RECOVERY_THRESHOLD,
+  clearQuotaBlock,
+  entryFor,
+  isActive,
+  keyId,
+  readState,
+  recoveryRatio,
+  setEnabled,
+  setMode,
+  writeState,
+} from './state.js'
 
 const USAGE_TTL_MS = 60000
 const usageCache = new Map()
 
-const MANAGER_STATE = 'tavily-manager.json'
 const LEGACY_STATE = 'tavily-settings.json'
 const REFS = ['TAVILY_API_KEYS', 'TAVILY_API_KEY']
+const MODES = new Set([MODE_PRIORITY, MODE_ROUND_ROBIN])
 
-function statePath(file) {
-  return join(resolveDshHome(), file)
-}
+const READONLY_LIST = 'TAVILY_API_KEYS is supplied read-only by the launching environment, so the key list cannot be changed here. Unset it in the shell you start dsh from, or manage keys in ~/.dsh/.credentials.yaml.'
+const READONLY_PRIMARY = 'That key comes from TAVILY_API_KEY, which the launching environment supplies read-only. Unset it in the shell you start dsh from.'
 
-function readState(file) {
-  return readJsonFile(statePath(file), {})
-}
-
-function writeState(file, state) {
-  writeFileSync(statePath(file), JSON.stringify(state, null, 2) + '\n', { mode: 0o600 })
+function legacyStatePath() {
+  return join(resolveDshHome(), LEGACY_STATE)
 }
 
 function readBody(req) {
@@ -48,9 +59,24 @@ function readBody(req) {
   })
 }
 
-async function fetchUsageDetailsFor(key) {
+function metric(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * Fetch one key's usage. The response separates the key's own counters from
+ * the account plan and pay-as-you-go counters; recovery uses the account
+ * counters because 432/433 are account-level plan/paygo errors.
+ *
+ * `minFetchedAt` forces a fresh request when the cached sample predates a
+ * quota block; a sample taken before the block must not clear it.
+ */
+async function fetchUsageDetailsFor(key, { minFetchedAt = 0 } = {}) {
   const cached = usageCache.get(key)
-  if (cached !== undefined && Date.now() - cached.at < USAGE_TTL_MS) return cached.details
+  const minAt = Number.isFinite(minFetchedAt) ? minFetchedAt : 0
+  if (cached !== undefined && Date.now() - cached.at < USAGE_TTL_MS && cached.details.fetchedAt >= minAt) {
+    return cached.details
+  }
   try {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 15000)
@@ -66,23 +92,27 @@ async function fetchUsageDetailsFor(key) {
     if (!response.ok) return null
     const json = await response.json()
     const account = json !== null && typeof json === 'object' ? json.account : undefined
-    const keyUsage = json !== null && typeof json === 'object' ? json.key : undefined
-    const usage = keyUsage !== undefined && typeof keyUsage.usage === 'number'
-      ? keyUsage.usage
-      : (account !== undefined && typeof account.plan_usage === 'number' ? account.plan_usage : null)
-    const planUsage = account !== undefined && typeof account.plan_usage === 'number'
-      ? account.plan_usage
-      : (keyUsage !== undefined && typeof keyUsage.usage === 'number' ? keyUsage.usage : null)
-    const planLimit = account !== undefined && typeof account.plan_limit === 'number'
-      ? account.plan_limit
-      : (keyUsage !== undefined && typeof keyUsage.limit === 'number' ? keyUsage.limit
-        : (keyUsage !== undefined && typeof keyUsage.plan_limit === 'number' ? keyUsage.plan_limit : null))
-    const currentPlan = account !== undefined && typeof account.plan === 'string'
-      ? account.plan
-      : (keyUsage !== undefined && typeof keyUsage.plan === 'string' ? keyUsage.plan : null)
-    if (usage === null && planUsage === null) return null
-    const details = { usage, planUsage, planLimit, currentPlan }
-    usageCache.set(key, { at: Date.now(), details })
+    const keyInfo = json !== null && typeof json === 'object' ? json.key : undefined
+    const keyUsage = metric(keyInfo?.usage)
+    const keyLimit = metric(keyInfo?.limit)
+    const planUsage = metric(account?.plan_usage)
+    const planLimit = metric(account?.plan_limit)
+    const paygoUsage = metric(account?.paygo_usage)
+    const paygoLimit = metric(account?.paygo_limit)
+    const currentPlan = account !== undefined && typeof account.current_plan === 'string' ? account.current_plan : null
+    if (keyUsage === null && planUsage === null && paygoUsage === null) return null
+    const details = {
+      usage: keyUsage !== null ? keyUsage : planUsage,
+      keyUsage,
+      keyLimit,
+      planUsage,
+      planLimit,
+      paygoUsage,
+      paygoLimit,
+      currentPlan,
+      fetchedAt: Date.now(),
+    }
+    usageCache.set(key, { at: details.fetchedAt, details })
     return details
   } catch {
     return null
@@ -174,11 +204,11 @@ export function installBackend(ctx) {
 
   // ── key manager payload ────────────────────────────────────────────────────
   async function buildManagerPayload(keys, source = 'list') {
-    const state = readState(MANAGER_STATE)
+    const state = readState()
     const keySavedAt = state.keySavedAt !== undefined && typeof state.keySavedAt === 'object' ? state.keySavedAt : {}
     if (Object.keys(keySavedAt).length === 0 && credentials !== undefined) {
       // Migrate dates recorded by the pre-0.2 layout (ref-keyed legacy file).
-      const legacy = readJsonFile(statePath(LEGACY_STATE), null)
+      const legacy = readJsonFile(legacyStatePath(), null)
       if (legacy !== null && typeof legacy === 'object') {
         for (const ref of REFS) {
           const entry = legacy[ref]
@@ -193,31 +223,42 @@ export function installBackend(ctx) {
         }
       }
     }
-    const display = keys.map((value) => {
-      const masked = maskValue(value)
-      return {
-        masked,
-        savedAt: keySavedAt[masked] !== undefined ? keySavedAt[masked] : null,
-      }
-    })
     // The card needs to know what it may change. A ref inherited from the
     // launching environment is read-only, and saying so beats a raw 500 from
     // `set` after the list has already been written.
     const keysWritable = credentials === undefined ? true : await refWritable(credentials, 'TAVILY_API_KEYS')
     const primaryWritable = credentials === undefined ? true : await refWritable(credentials, 'TAVILY_API_KEY')
     const removable = source === 'list' ? keysWritable : primaryWritable
-    return {
-      keys: display.map((entry, index) => ({
-        masked: entry.masked,
-        savedAt: entry.savedAt,
-        primary: index === 0,
+    const entries = keys.map((value) => {
+      const id = keyId(value)
+      const entry = entryFor(state, id)
+      const masked = maskValue(value)
+      return {
+        id,
+        masked,
+        savedAt: keySavedAt[masked] !== undefined ? keySavedAt[masked] : null,
+        enabled: entry.enabled,
+        active: isActive(entry),
+        quotaBlock: entry.quotaBlock,
         removable,
-      })),
+      }
+    })
+    const firstActive = entries.findIndex((entry) => entry.active)
+    return {
+      keys: entries.map((entry, index) => ({ ...entry, primary: state.mode === MODE_PRIORITY && index === firstActive })),
+      mode: state.mode,
       source,
       writable: { keys: keysWritable, primary: primaryWritable },
     }
   }
 
+  /**
+   * The usage refresh is also the reconciliation point for quota blocks: a
+   * 432/433 key comes back only when the same limit the block was based on is
+   * below 40% again. This is a GET with a side effect on purpose — the card's
+   * refresh is the only trigger, and it must leave the tool layer with the
+   * recovered state.
+   */
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/tavily-usage',
@@ -226,17 +267,37 @@ export function installBackend(ctx) {
       try {
         const { values: keys } = await collectStoredKeys(credentials)
         if (keys.length === 0) return send(res, 200, { ok: false, error: 'no Tavily API key configured' })
-        const perKey = []
+        const initial = readState()
+        const fetched = []
         for (const key of keys) {
-          try {
-            const usage = await fetchUsageDetailsFor(key)
-            perKey.push(usage !== null
-              ? { ok: true, masked: maskValue(key), ...usage }
-              : { ok: false, masked: maskValue(key), error: 'usage unavailable' })
-          } catch (error) {
-            perKey.push({ ok: false, masked: maskValue(key), error: String(error && error.message ? error.message : error) })
+          const id = keyId(key)
+          const entry = entryFor(initial, id)
+          const blockAt = entry.quotaBlock !== null ? Date.parse(entry.quotaBlock.at) : 0
+          const details = await fetchUsageDetailsFor(key, { minFetchedAt: Number.isFinite(blockAt) ? blockAt : 0 })
+          if (details !== null && entry.quotaBlock !== null) {
+            const ratio = recoveryRatio(entry.quotaBlock.reason, details)
+            if (ratio !== null && ratio < RECOVERY_THRESHOLD) {
+              if (clearQuotaBlock(id, entry.quotaBlock.reason, details.fetchedAt)) {
+                ctx.logger.info('tavily: quota block cleared for key %s (%s)', id, entry.quotaBlock.reason)
+              }
+            }
           }
+          fetched.push({ key, id, details })
         }
+        const finalState = readState()
+        const perKey = fetched.map(({ key, id, details }) => {
+          const entry = entryFor(finalState, id)
+          const base = {
+            id,
+            masked: maskValue(key),
+            enabled: entry.enabled,
+            active: isActive(entry),
+            quotaBlock: entry.quotaBlock,
+          }
+          return details === null
+            ? { ok: false, ...base, error: 'usage unavailable' }
+            : { ok: true, ...base, ...details }
+        })
         const okRows = perKey.filter((row) => row.ok)
         return send(res, 200, {
           ok: true,
@@ -283,7 +344,22 @@ export function installBackend(ctx) {
           const orderMasked = Array.isArray(body.order)
             ? body.order.filter((item) => typeof item === 'string' && item.length > 0)
             : []
+          const modeValue = body.mode === undefined ? null : body.mode
+          if (modeValue !== null && (typeof modeValue !== 'string' || !MODES.has(modeValue))) {
+            return send(res, 400, { ok: false, error: 'mode must be priority or round_robin' })
+          }
+          if (body.setEnabled !== undefined && !Array.isArray(body.setEnabled)) {
+            return send(res, 400, { ok: false, error: 'setEnabled must be an array of { id, enabled }' })
+          }
+          const toggles = []
+          for (const item of Array.isArray(body.setEnabled) ? body.setEnabled : []) {
+            if (item === null || typeof item !== 'object' || typeof item.id !== 'string' || item.id.length === 0 || typeof item.enabled !== 'boolean') {
+              return send(res, 400, { ok: false, error: 'setEnabled must be an array of { id, enabled }' })
+            }
+            toggles.push({ id: item.id, enabled: item.enabled })
+          }
 
+          const keysChanged = addValues.length > 0 || removeMasked.length > 0 || orderMasked.length > 0
           let { values: stored, source } = await collectStoredKeys(credentials)
           if (orderMasked.length > 0) {
             const reordered = reorderByMask(stored, orderMasked)
@@ -299,45 +375,58 @@ export function installBackend(ctx) {
           for (const value of addValues) {
             if (!values.includes(value)) values.push(value)
           }
+          const knownIds = new Set(values.map(keyId))
+          for (const toggle of toggles) {
+            if (!knownIds.has(toggle.id)) {
+              return send(res, 409, { ok: false, error: 'setEnabled references a key that is not in the list' })
+            }
+          }
 
           // A ref the launching environment supplies is inherited READ-ONLY: set and
-          // unset throw for it. Decide that BEFORE writing anything. The old order
-          // wrote `TAVILY_API_KEYS` first and then threw on the derived-primary sync,
-          // so the card reported a failure for a write that had half happened — and
-          // the unioned read then put the deleted key straight back.
-          const canWriteList = await refWritable(credentials, 'TAVILY_API_KEYS')
-          const canWritePrimary = await refWritable(credentials, 'TAVILY_API_KEY')
-          const READONLY_LIST = 'TAVILY_API_KEYS is supplied read-only by the launching environment, so the key list cannot be changed here. Unset it in the shell you start dsh from, or manage keys in ~/.dsh/.credentials.yaml.'
-          const READONLY_PRIMARY = 'That key comes from TAVILY_API_KEY, which the launching environment supplies read-only. Unset it in the shell you start dsh from.'
-          if (!canWriteList && (addValues.length > 0 || removeMasked.length > 0 || orderMasked.length > 0)) {
-            return send(res, 409, { ok: false, error: READONLY_LIST })
-          }
-          if (!canWritePrimary && source === 'primary' && removeMasked.length > 0) {
-            return send(res, 409, { ok: false, error: READONLY_PRIMARY })
-          }
-          // Emptying the list while an inherited primary still carries a key would
-          // read straight back as that key, so refuse rather than appear to undo itself.
-          if (values.length === 0 && !canWritePrimary) {
-            const inherited = parseKeyList(await resolveRef(credentials, 'TAVILY_API_KEY') ?? '')
-            if (inherited.length > 0) return send(res, 409, { ok: false, error: READONLY_PRIMARY })
+          // unset throw for it. Decide that BEFORE writing anything. Mode and
+          // availability changes only touch the routing state, so they stay
+          // available even when the list itself is read-only.
+          if (keysChanged) {
+            const canWriteList = await refWritable(credentials, 'TAVILY_API_KEYS')
+            const canWritePrimary = await refWritable(credentials, 'TAVILY_API_KEY')
+            if (!canWriteList) return send(res, 409, { ok: false, error: READONLY_LIST })
+            if (!canWritePrimary && source === 'primary' && removeMasked.length > 0) {
+              return send(res, 409, { ok: false, error: READONLY_PRIMARY })
+            }
+            // Emptying the list while an inherited primary still carries a key would
+            // read straight back as that key, so refuse rather than appear to undo itself.
+            if (values.length === 0 && !canWritePrimary) {
+              const inherited = parseKeyList(await resolveRef(credentials, 'TAVILY_API_KEY') ?? '')
+              if (inherited.length > 0) return send(res, 409, { ok: false, error: READONLY_PRIMARY })
+            }
+
+            if (values.length === 0) {
+              await credentials.unset('TAVILY_API_KEYS')
+              await syncPrimary(credentials, null)
+            } else {
+              await credentials.set('TAVILY_API_KEYS', values.join(','))
+              await syncPrimary(credentials, values[0])
+            }
+
+            // Keep the saved dates, prune availability records for removed keys,
+            // and preserve mode/availability while replacing keySavedAt.
+            const state = readState()
+            const kept = new Set(values.map(keyId))
+            for (const id of Object.keys(state.keys)) {
+              if (!kept.has(id)) delete state.keys[id]
+            }
+            const now = new Date().toISOString()
+            const nextSavedAt = {}
+            for (const value of values) {
+              const masked = maskValue(value)
+              nextSavedAt[masked] = state.keySavedAt[masked] !== undefined ? state.keySavedAt[masked] : now
+            }
+            state.keySavedAt = nextSavedAt
+            writeState(state)
           }
 
-          if (values.length === 0) {
-            await credentials.unset('TAVILY_API_KEYS')
-            await syncPrimary(credentials, null)
-          } else {
-            await credentials.set('TAVILY_API_KEYS', values.join(','))
-            await syncPrimary(credentials, values[0])
-          }
-
-          const state = readState(MANAGER_STATE)
-          const keySavedAt = state.keySavedAt !== undefined && typeof state.keySavedAt === 'object' ? state.keySavedAt : {}
-          const now = new Date().toISOString()
-          for (const value of values) {
-            const masked = maskValue(value)
-            if (keySavedAt[masked] === undefined) keySavedAt[masked] = now
-          }
-          writeState(MANAGER_STATE, { keySavedAt })
+          if (modeValue !== null) setMode(modeValue)
+          for (const toggle of toggles) setEnabled(toggle.id, toggle.enabled)
 
           return send(res, 200, { ok: true, ...(await buildManagerPayload(values, source)) })
         }
@@ -347,5 +436,4 @@ export function installBackend(ctx) {
       }
     },
   }), 'tavily-backend: route /api/tavily-manager')
-
 }

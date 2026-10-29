@@ -2,8 +2,10 @@
  * Tool half of `@moguiyu/dsh-tavily`: the advanced `tavily_search` model tool
  * plus the extra Tavily direct tools (`tavily_extract`, `tavily_map`,
  * `tavily_crawl`). Keys resolve from `TAVILY_API_KEYS` per call, falling back
- * to `TAVILY_API_KEY`; keys are tried in list order, top first, with failover on
- * 401/429/432/433.
+ * to `TAVILY_API_KEY`. The manager's mode decides whether every call starts at
+ * the first active key (priority) or after the key attempted by the previous
+ * call (round-robin). Only active keys are tried; a 432/433 response disables
+ * the key until the usage refresh sees that limit fall below 40%.
  *
  * The tools are an OPTION for search, never a replacement: they are
  * independent of the built-in `web_search` provider, and registering them
@@ -18,6 +20,17 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parseKeyList } from './lib.js'
+import {
+  MODE_ROUND_ROBIN,
+  clearQuotaBlock,
+  entryFor,
+  getCursor,
+  isActive,
+  keyId,
+  readState,
+  recordQuotaBlock,
+  setCursor,
+} from './state.js'
 
 const TAVILY_BASE_URL = 'https://api.tavily.com'
 
@@ -109,7 +122,7 @@ async function callOperation(operation, body, key, exec, timeoutMs) {
         'content-type': 'application/json',
         accept: 'application/json',
         authorization: 'Bearer ' + key,
-        'user-agent': 'dsh-tool-tavily-search/0.2.0',
+        'user-agent': 'dsh-tool-tavily-search/0.6.0',
       },
       body: JSON.stringify(body),
       signal: combined.signal,
@@ -467,29 +480,128 @@ export function installTavilyTool(ctx) {
   }
 
   /**
-   * Run `body` through the key list in order. The list is the priority: every
-   * call starts at the first key, and only a 401/429/432/433 outcome moves on
-   * to the next one. Returns the response JSON.
+   * Active entries in list order. Round-robin rotates the list so it starts
+   * after the key attempted by the previous call; priority mode keeps the file
+   * order. The cursor is an id, not an index, so reordering does not move it to
+   * an unrelated key.
+   */
+  function attemptOrder(entries, mode) {
+    const active = entries.filter((entry) => isActive(entry.state))
+    if (active.length === 0 || mode !== MODE_ROUND_ROBIN) return active
+    const cursor = getCursor()
+    if (cursor === null) return active
+    const cursorIndex = entries.findIndex((entry) => entry.id === cursor)
+    if (cursorIndex === -1) return active
+    const next = active.findIndex((entry) => entries.indexOf(entry) > cursorIndex)
+    return next === -1 ? active : active.slice(next).concat(active.slice(0, next))
+  }
+
+  /** 432 is the plan limit, 433 the pay-as-you-go limit; both are quota. */
+  function quotaReason(statusCode) {
+    if (statusCode === 432) return 'plan'
+    if (statusCode === 433) return 'paygo'
+    return undefined
+  }
+
+  function allOffError(operation, keys, state) {
+    const blocked = keys.filter((key) => entryFor(state, keyId(key)).quotaBlock !== null).length
+    const manual = keys.filter((key) => entryFor(state, keyId(key)).enabled === false).length
+    return new Error(`tavily_${operation}: no active keys — ${blocked} quota-blocked and ${manual} manually disabled of ${keys.length}; enable one in the Tavily Search settings card`)
+  }
+
+  /**
+   * Everything is off. Probe the oldest quota-blocked key once with the real
+   * operation: the usage refresh only runs when the settings card is open, so
+   * without this a key that recovered after its billing cycle could stay off
+   * forever. Manually disabled keys are never probed.
+   */
+  async function probeOldestBlocked(operation, body, timeoutMs, exec, entries, source) {
+    const state = readState()
+    const candidate = entries
+      .map((entry) => ({ ...entry, state: entryFor(state, entry.id) }))
+      .filter((entry) => entry.state.enabled && entry.state.quotaBlock !== null)
+      .sort((a, b) => Date.parse(a.state.quotaBlock.at) - Date.parse(b.state.quotaBlock.at))[0]
+    if (candidate === undefined) throw allOffError(operation, entries.map((entry) => entry.key), state)
+
+    const started = Date.now()
+    let outcome
+    try {
+      outcome = await callOperation(operation, body, candidate.key, exec, timeoutMs)
+    } catch (error) {
+      throw new Error(`tavily_${operation}: no active keys; the quota-blocked probe failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (outcome.kind === 'ok') {
+      try {
+        // A successful real request proves the key serves again. Clear only a
+        // block that existed before the probe started; a concurrent 432 must
+        // not be undone.
+        clearQuotaBlock(candidate.id, undefined, started)
+      } catch (error) {
+        ctx.logger.warn('tavily_search: could not clear quota block: %s', error instanceof Error ? error.message : String(error))
+      }
+      if (state.mode === MODE_ROUND_ROBIN) setCursor(candidate.id)
+      ctx.logger.info(`tavily_${operation}: quota-blocked probe succeeded %j`, { status: outcome.statusCode, ms: Date.now() - started, keys: entries.length, source })
+      return outcome.json
+    }
+    // Refresh the block timestamp so the next all-off call probes a different
+    // key. A 401/429 probe is retryable but not evidence of quota recovery;
+    // keeping the original reason is enough.
+    try {
+      recordQuotaBlock(candidate.id, quotaReason(outcome.statusCode) ?? candidate.state.quotaBlock.reason)
+    } catch (error) {
+      ctx.logger.warn('tavily_search: could not persist quota block: %s', error instanceof Error ? error.message : String(error))
+    }
+    throw new Error(`tavily_${operation}: no active keys; the oldest quota-blocked key still returned HTTP ${outcome.statusCode}. Re-enable a key or refresh usage in the Tavily Search settings card.`)
+  }
+
+  /**
+   * Run `body` through the active keys. Priority mode starts at the first
+   * active key on every call; round-robin starts after the previously
+   * attempted key. A 401/429/432/433 outcome moves on to the next active key,
+   * and 432/433 also records a quota block for later calls.
    */
   async function requestWithFailover(operation, body, timeoutMs, exec, detail) {
     const { keys, source } = await resolveKeys()
     if (keys.length === 0) {
       throw new Error(`tavily_${operation}: TAVILY_API_KEYS or TAVILY_API_KEY is not configured — add it via the Tavily Search settings card or ~/.dsh/.credentials.yaml (comma-separated)`)
     }
+    const state = readState()
+    const entries = keys.map((key) => {
+      const id = keyId(key)
+      return { key, id, state: entryFor(state, id) }
+    })
+    const order = attemptOrder(entries, state.mode)
+    if (order.length === 0) {
+      const json = await probeOldestBlocked(operation, body, timeoutMs, exec, entries, source)
+      const extra = typeof detail === 'function' ? detail(json) : {}
+      ctx.logger.info(`tavily_${operation}: ok after quota probe %j`, { ...extra, keys: keys.length, source })
+      return json
+    }
+
     let lastStatus = 0
-    for (let index = 0; index < keys.length; index++) {
-      const key = keys[index]
+    let attempted = 0
+    for (const item of order) {
+      if (state.mode === MODE_ROUND_ROBIN) setCursor(item.id)
+      attempted++
       const started = Date.now()
-      const outcome = await callOperation(operation, body, key, exec, timeoutMs)
+      const outcome = await callOperation(operation, body, item.key, exec, timeoutMs)
       if (outcome.kind === 'ok') {
         const extra = typeof detail === 'function' ? detail(outcome.json) : {}
-        ctx.logger.info(`tavily_${operation}: ok %j`, { ...extra, status: outcome.statusCode, ms: Date.now() - started, keys: keys.length, source })
+        ctx.logger.info(`tavily_${operation}: ok %j`, { ...extra, status: outcome.statusCode, ms: Date.now() - started, keys: keys.length, active: order.length, mode: state.mode, source })
         return outcome.json
       }
       lastStatus = outcome.statusCode
-      ctx.logger.info(`tavily_${operation}: key %d/%d returned HTTP %d`, index + 1, keys.length, outcome.statusCode)
+      const reason = quotaReason(outcome.statusCode)
+      if (reason !== undefined) {
+        try {
+          recordQuotaBlock(item.id, reason)
+        } catch (error) {
+          ctx.logger.warn('tavily_search: could not persist quota block: %s', error instanceof Error ? error.message : String(error))
+        }
+      }
+      ctx.logger.info(`tavily_${operation}: key %d/%d returned HTTP %d%s`, attempted, order.length, outcome.statusCode, reason !== undefined ? '; disabled until usage recovers' : '')
     }
-    throw new Error(`tavily_${operation}: all ${keys.length} configured key(s) failed with HTTP ${lastStatus} (invalid key, rate limit, or quota exhausted)`)
+    throw new Error(`tavily_${operation}: all ${attempted} attempted key(s) failed with HTTP ${lastStatus} (invalid key, rate limit, or quota exhausted)`)
   }
 
   tools.register(defineTool({
