@@ -1,12 +1,13 @@
 {
   "name": "@moguiyu/dsh-tavily",
-  "version": "0.6.0",
-  "description": "Advanced Tavily model tools for DeepSeek Harness (tavily_search, tavily_extract, tavily_map, tavily_crawl) with a key, call-order, and availability management card on the Plugins page. The built-in web_search is never replaced.",
+  "version": "0.7.0",
+  "description": "Advanced Tavily model tools for DeepSeek Harness (tavily_search, tavily_extract, tavily_map, tavily_crawl) with a key, call-order, and availability management card on the Plugins page. Agent presets mount @moguiyu/dsh-tavily/tools to receive the tools; the Host row alone carries only the card and its routes. The built-in web_search is never replaced.",
   "icon": "./icon.svg",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
+    "./tools": "./src/tools-entry.js",
     "./invariant": "./src/invariant.js",
     "./client": "./lib/client.js",
     "./icon": "./icon.svg",
@@ -16,6 +17,7 @@
   "files": [
     "src",
     "lib",
+    "scripts",
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
@@ -54,6 +56,7 @@
   },
   "scripts": {
     "build": "node scripts/build-client.mjs",
+    "check": "node --check src/index.js && node --check src/tools-entry.js && node --check src/tools.js && node --check src/backend.js && node --check src/state.js && node --check src/lib.js && node --check src/invariant.js && node --check src/client.js",
     "test": "node --test"
   },
   "keywords": [

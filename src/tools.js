@@ -1,5 +1,6 @@
 /**
- * Tool half of `@moguiyu/dsh-tavily`: the advanced `tavily_search` model tool
+ * Tool half of `@moguiyu/dsh-tavily`, which an agent preset mounts through the
+ * `./tools` entry (`tools-entry.js`): the advanced `tavily_search` model tool
  * plus the extra Tavily direct tools (`tavily_extract`, `tavily_map`,
  * `tavily_crawl`). Keys resolve from `TAVILY_API_KEYS` per call, falling back
  * to `TAVILY_API_KEY`. The manager's mode decides whether every call starts at
@@ -11,12 +12,18 @@
  * independent of the built-in `web_search` provider, and registering them
  * touches `web.searchProvider` not at all.
  *
- * There is deliberately NO tool-level on/off switch. The plugin is either
- * composed or not, and the Plugins page's own toggle is the only on/off.
- * A tool-level switch needs the tool half to be disposable and re-installable
- * at runtime across two packages, and that contract is what broke twice
- * (0.1.6 row restart, then the 0.2.x dependency-range skew). Removing the
- * capability removes the failure mode; see `docs/agents/verification.md`.
+ * There is deliberately NO tool-level on/off switch. Whether an agent sees
+ * these tools is decided by its preset: the preset lists
+ * `@moguiyu/dsh-tavily/tools` and gets one set of tools and prompt sections in
+ * its own composition scope, or it does not and gets none. The Host row only
+ * carries the management card and the two /api routes, so disabling it never
+ * removes a tool from a preset.
+ *
+ * The round-robin cursor lives in the install closure below rather than in
+ * `state.js`, so each mounting composition counts on its own even though this
+ * module is imported once per process. Credentials, the manager state file, and
+ * the usage cache stay shared on purpose: changing the call order or a key's
+ * availability in the card applies to every preset's next call.
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parseKeyList } from './lib.js'
@@ -24,12 +31,10 @@ import {
   MODE_ROUND_ROBIN,
   clearQuotaBlock,
   entryFor,
-  getCursor,
   isActive,
   keyId,
   readState,
   recordQuotaBlock,
-  setCursor,
 } from './state.js'
 
 const TAVILY_BASE_URL = 'https://api.tavily.com'
@@ -122,7 +127,9 @@ async function callOperation(operation, body, key, exec, timeoutMs) {
         'content-type': 'application/json',
         accept: 'application/json',
         authorization: 'Bearer ' + key,
-        'user-agent': 'dsh-tool-tavily-search/0.6.0',
+        // Keep in step with package.json "version"; test/entries.test.js
+        // asserts the two match.
+        'user-agent': 'dsh-tool-tavily-search/0.7.0',
       },
       body: JSON.stringify(body),
       signal: combined.signal,
@@ -457,6 +464,9 @@ export function installTavilyTool(ctx) {
   // half down cleanly: on row unload, and on the Plugins page's runtime unload
   // of the bundle (0.1.6-alpha.2 unloads without restarting anything).
   const disposers = []
+  // Id of the key attempted by this installation's previous round-robin call,
+  // memory only. Priority mode never reads it.
+  const rotation = { cursor: null }
   const tools = {
     register: (definition) => { disposers.push(ctx.tools.register(definition)) },
   }
@@ -488,7 +498,7 @@ export function installTavilyTool(ctx) {
   function attemptOrder(entries, mode) {
     const active = entries.filter((entry) => isActive(entry.state))
     if (active.length === 0 || mode !== MODE_ROUND_ROBIN) return active
-    const cursor = getCursor()
+    const cursor = rotation.cursor
     if (cursor === null) return active
     const cursorIndex = entries.findIndex((entry) => entry.id === cursor)
     if (cursorIndex === -1) return active
@@ -539,7 +549,7 @@ export function installTavilyTool(ctx) {
       } catch (error) {
         ctx.logger.warn('tavily_search: could not clear quota block: %s', error instanceof Error ? error.message : String(error))
       }
-      if (state.mode === MODE_ROUND_ROBIN) setCursor(candidate.id)
+      if (state.mode === MODE_ROUND_ROBIN) rotation.cursor = candidate.id
       ctx.logger.info(`tavily_${operation}: quota-blocked probe succeeded %j`, { status: outcome.statusCode, ms: Date.now() - started, keys: entries.length, source })
       return outcome.json
     }
@@ -581,7 +591,7 @@ export function installTavilyTool(ctx) {
     let lastStatus = 0
     let attempted = 0
     for (const item of order) {
-      if (state.mode === MODE_ROUND_ROBIN) setCursor(item.id)
+      if (state.mode === MODE_ROUND_ROBIN) rotation.cursor = item.id
       attempted++
       const started = Date.now()
       const outcome = await callOperation(operation, body, item.key, exec, timeoutMs)
@@ -722,17 +732,6 @@ export function installTavilyTool(ctx) {
       name: 'tool:tavily_direct',
       order: 112,
       text: 'For pages already known by URL, use tavily_extract to pull their full content, tavily_map to discover a site\'s links without fetching content, and tavily_crawl to capture the extracted content of an entire site. These are optional extras on top of the built-in web_search tool, which is never replaced.',
-    })
-  }
-
-  const credentials = ctx.get('credentials')
-  if (credentials !== undefined) {
-    resolveKeys().then(({ keys }) => {
-      if (keys.length === 0) {
-        ctx.logger.warn('tavily_search: TAVILY_API_KEYS or TAVILY_API_KEY is not configured; add it via the Tavily Search settings card or ~/.dsh/.credentials.yaml')
-      }
-    }).catch((error) => {
-      ctx.logger.warn('tavily_search: credential check failed: %s', error instanceof Error ? error.message : String(error))
     })
   }
 

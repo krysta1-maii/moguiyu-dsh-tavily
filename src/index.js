@@ -1,46 +1,34 @@
 /**
- * `@moguiyu/dsh-tavily` — the combined plugin, and now the only package.
+ * `@moguiyu/dsh-tavily` Host entry: the Plugins-page management card, its two
+ * exact routes (/api/tavily-usage, /api/tavily-manager), and one startup check
+ * for a missing Tavily key.
  *
- * Both halves live here, so there is no cross-package contract left to skew:
+ * This entry registers no model tools and no tool:tavily_search /
+ * tool:tavily_direct prompt section. Those live in the separate
+ * `@moguiyu/dsh-tavily/tools` entry that agent presets mount, so each preset
+ * decides whether its agents receive the Tavily tools. Keeping the routes here
+ * means several presets can mount the tools entry without registering a second
+ * copy of either route — `ctx.webServer.register` throws on a duplicate exact
+ * path, which would mark the later preset broken.
  *
- * - the model tools (`tools.js`) — `tavily_search`, `tavily_extract`,
- *   `tavily_map`, `tavily_crawl`, with priority or round-robin selection,
- *   per-key availability, and failover on 401/429/432/433;
- * - key and usage management (`backend.js`) — `/api/tavily-usage` and
- *   `/api/tavily-manager`, including the call mode and availability records;
- * - shared routing state (`state.js`) — mode, manual/automatic availability, and
- *   the memory-only round-robin cursor;
- * - the browser card (`client.js`) — keys, usage, call order, and availability.
+ * The Host row also stays the only carrier of the Client half: dsh-client-modules
+ * scans Host Loader entries for a `dsh.client` declaration, so moving this row
+ * into a preset would drop the card from the Plugins page.
  *
- * Composing the plugin registers the tools. There is NO tool-level on/off:
- * the Plugins page's own bundle toggle is the only one. Two earlier designs
- * are gone deliberately, both recorded in `docs/agents/verification.md`:
- *
- * 1. A row restart. On 0.1.6 it re-mounts the fiber into a scope the agent
- *    does not see, so the tools ended up registered nowhere and stayed
- *    missing, process-wide, until dsh restarted.
- * 2. A tool-level switch split across packages. The combined package needed a
- *    disposer from the tool half, but its dependency range still allowed the
- *    old tool half, so `installTavilyTool` returned `undefined` and turning
- *    the switch off threw. One package removes the range as a failure mode.
- *
- * The built-in `web_search` tool is never replaced: no web search provider is
- * registered, `web.searchProvider` / `DSH_WEB_SEARCH_PROVIDER` are never
- * rewritten, and `ctx.web` is untouched.
+ * The package never registers a web search provider and never changes
+ * `ctx.web`, so the built-in `web_search` and `web_fetch` keep their native
+ * providers and schemas.
  */
-import { installTavilyTool } from './tools.js'
-import { installBackend } from './backend.js'
+import { installBackend, warnIfNoKeys } from './backend.js'
 
 export const name = 'dsh-tavily'
 
-export const inject = ['tools', 'webServer', 'credentials', 'systemPrompt']
+export const inject = ['webServer', 'credentials']
 
 export function apply(ctx) {
-  const disposeTools = installTavilyTool(ctx)
+  // The owning fiber disposes both management routes when the row is disabled,
+  // unloaded, or the bundle is removed.
   installBackend(ctx)
-
-  // The fiber owns the teardown: unloading the row — including the Plugins
-  // page's runtime unload on 0.1.6-alpha.2 — unregisters every tool and
-  // prompt section this row added.
-  ctx.effect(() => () => { disposeTools() })
+  // One check per Host mount, not one per preset that mounts the tools entry.
+  warnIfNoKeys(ctx)
 }

@@ -14,8 +14,9 @@
  *
  * State lives next to the existing `keySavedAt` records in
  * `~/.dsh/tavily-manager.json`, keyed by a short SHA-256 id rather than the
- * display mask. The file holds no secret. The round-robin cursor is deliberately
- * memory-only: it changes on every call and does not need to survive a restart.
+ * display mask. The file holds no secret. The file is shared by every preset:
+ * the call order and the availability records apply process-wide, while the
+ * round-robin cursor is per installation and lives in `tools.js`.
  */
 import { createHash } from 'node:crypto'
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
@@ -182,19 +183,4 @@ export function recoveryRatio(reason, details) {
   if (reason === 'plan') return usageRatio(details.planUsage, details.planLimit)
   if (reason === 'paygo') return usageRatio(details.paygoUsage, details.paygoLimit)
   return null
-}
-
-let cursor = null
-
-/** Id of the key attempted by the previous round-robin call; memory only. */
-export function getCursor() {
-  return cursor
-}
-
-export function setCursor(id) {
-  cursor = id
-}
-
-export function resetCursor() {
-  cursor = null
 }

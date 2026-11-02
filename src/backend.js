@@ -10,6 +10,11 @@
  * availability record is deliberately separate from the credential list, so a
  * key can be turned off or quota-blocked without rewriting the list and
  * without losing its position.
+ *
+ * Only the package root entry imports this module. The preset tools entry
+ * (`./tools`) never loads it, so no preset can register a second copy of
+ * either route, and `/api/tavily-manager` plus `/api/tavily-usage` exist
+ * exactly once per Host.
  */
 import { join } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
@@ -185,6 +190,28 @@ async function syncPrimary(credentials, value) {
   } catch {
     return false
   }
+}
+
+/**
+ * Warn once, at Host startup, when neither `TAVILY_API_KEYS` nor
+ * `TAVILY_API_KEY` holds a key.
+ *
+ * The check lives here rather than in `installTavilyTool` because the tools
+ * entry is mounted by several presets; a check there would print the same
+ * warning once per preset. It reuses `collectStoredKeys`, so it reads the
+ * credential service exactly as the card does, caches no secret, and prints no
+ * key material. Any failure degrades to one warning.
+ */
+export function warnIfNoKeys(ctx) {
+  const credentials = ctx !== undefined && ctx !== null ? ctx.get('credentials') : undefined
+  if (credentials === undefined || credentials === null) return
+  collectStoredKeys(credentials).then(({ values }) => {
+    if (values.length === 0) {
+      ctx.logger.warn('tavily_search: TAVILY_API_KEYS or TAVILY_API_KEY is not configured; add it via the Tavily Search settings card or ~/.dsh/.credentials.yaml')
+    }
+  }).catch((error) => {
+    ctx.logger.warn('tavily_search: credential check failed: %s', error instanceof Error ? error.message : String(error))
+  })
 }
 
 /**

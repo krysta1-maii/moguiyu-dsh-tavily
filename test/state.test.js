@@ -1,6 +1,7 @@
 /**
- * Tests for the shared routing state: manual intent, quota blocks, recovery
- * metrics, and the memory-only round-robin cursor.
+ * Tests for the shared routing state: manual intent, quota blocks, and
+ * recovery metrics. The round-robin cursor is not state: it lives in each
+ * tools installation.
  */
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -11,24 +12,22 @@ import { after, beforeEach, test } from 'node:test'
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-tavily-state-'))
 after(() => rmSync(process.env.DSH_HOME, { recursive: true, force: true }))
 
+const stateModule = await import('../src/state.js')
 const {
   RECOVERY_THRESHOLD,
   entryFor,
-  getCursor,
   isActive,
   keyId,
   pruneKeys,
   readState,
   recordQuotaBlock,
   recoveryRatio,
-  resetCursor,
-  setCursor,
   setEnabled,
   setMode,
   statePath,
   clearQuotaBlock,
   usageRatio,
-} = await import('../src/state.js')
+} = stateModule
 
 const KEY = 'tvly-aaaaaaaaaaaaaaaaaaaa'
 const OTHER = 'tvly-bbbbbbbbbbbbbbbbbbbb'
@@ -36,7 +35,6 @@ const ID = keyId(KEY)
 
 beforeEach(() => {
   rmSync(statePath(), { force: true })
-  resetCursor()
 })
 
 test('an absent record is enabled and unblocked', () => {
@@ -126,10 +124,8 @@ test('a corrupt state file falls back to defaults', () => {
   assert.deepEqual(state.keys, {})
 })
 
-test('the round-robin cursor is memory-only', () => {
-  assert.equal(getCursor(), null)
-  setCursor(ID)
-  assert.equal(getCursor(), ID)
-  resetCursor()
-  assert.equal(getCursor(), null)
+test('the round-robin cursor is not part of the shared state module', () => {
+  for (const name of ['getCursor', 'setCursor', 'resetCursor']) {
+    assert.equal(name in stateModule, false, name + ' must not be exported from state.js')
+  }
 });

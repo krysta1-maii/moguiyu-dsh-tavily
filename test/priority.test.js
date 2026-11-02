@@ -18,7 +18,6 @@ const {
   keyId,
   readState,
   recordQuotaBlock,
-  resetCursor,
   setEnabled,
   setMode,
   statePath,
@@ -28,7 +27,6 @@ const KEYS = ['key-one-0000000000', 'key-two-1111111111', 'key-three-2222222222'
 
 beforeEach(() => {
   rmSync(statePath(), { force: true })
-  resetCursor()
 })
 
 /** Install the tools against a fake credentials service holding `keys`. */
