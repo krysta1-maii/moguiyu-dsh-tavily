@@ -129,7 +129,7 @@ async function callOperation(operation, body, key, exec, timeoutMs) {
         authorization: 'Bearer ' + key,
         // Keep in step with package.json "version"; test/entries.test.js
         // asserts the two match.
-        'user-agent': 'dsh-tool-tavily-search/0.7.0',
+        'user-agent': 'dsh-tool-tavily-search/0.7.1',
       },
       body: JSON.stringify(body),
       signal: combined.signal,
@@ -516,12 +516,12 @@ export function installTavilyTool(ctx) {
   function allOffError(operation, keys, state) {
     const blocked = keys.filter((key) => entryFor(state, keyId(key)).quotaBlock !== null).length
     const manual = keys.filter((key) => entryFor(state, keyId(key)).enabled === false).length
-    return new Error(`tavily_${operation}: no active keys — ${blocked} quota-blocked and ${manual} manually disabled of ${keys.length}; enable one in the Tavily Search settings card`)
+    return new Error(`tavily_${operation}: no active keys — ${blocked} quota-blocked and ${manual} manually disabled of ${keys.length}; enable one in the Tavily card on the Plugins page`)
   }
 
   /**
    * Everything is off. Probe the oldest quota-blocked key once with the real
-   * operation: the usage refresh only runs when the settings card is open, so
+   * operation: the usage refresh only runs when the Plugins page card is open, so
    * without this a key that recovered after its billing cycle could stay off
    * forever. Manually disabled keys are never probed.
    */
@@ -561,7 +561,7 @@ export function installTavilyTool(ctx) {
     } catch (error) {
       ctx.logger.warn('tavily_search: could not persist quota block: %s', error instanceof Error ? error.message : String(error))
     }
-    throw new Error(`tavily_${operation}: no active keys; the oldest quota-blocked key still returned HTTP ${outcome.statusCode}. Re-enable a key or refresh usage in the Tavily Search settings card.`)
+    throw new Error(`tavily_${operation}: no active keys; the oldest quota-blocked key still returned HTTP ${outcome.statusCode}. Re-enable a key or refresh usage in the Tavily card on the Plugins page.`)
   }
 
   /**
@@ -573,7 +573,7 @@ export function installTavilyTool(ctx) {
   async function requestWithFailover(operation, body, timeoutMs, exec, detail) {
     const { keys, source } = await resolveKeys()
     if (keys.length === 0) {
-      throw new Error(`tavily_${operation}: TAVILY_API_KEYS or TAVILY_API_KEY is not configured — add it via the Tavily Search settings card or ~/.dsh/.credentials.yaml (comma-separated)`)
+      throw new Error(`tavily_${operation}: TAVILY_API_KEYS or TAVILY_API_KEY is not configured — add it via the Tavily card on the Plugins page or ~/.dsh/.credentials.yaml (comma-separated)`)
     }
     const state = readState()
     const entries = keys.map((key) => {

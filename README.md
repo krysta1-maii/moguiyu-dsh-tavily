@@ -41,7 +41,8 @@ second preset to mount the same row would be marked broken. The Client card cann
 ## Install
 
 The Plugins card needs DSH **0.1.6-alpha.2 or newer**; on older 0.1.x lines the tools
-and routes still load, without a card. Node.js 22 or newer.
+and routes still load, without a card. The package code runs on Node.js 22 or newer;
+paired with DSH **0.2.2**, use Node.js **24.9 or newer**, the runtime's own floor.
 
 Install through **Plugins → Add plugin** in the Web UI, naming the absolute path of
 the package tarball or of an unpacked checkout; the manager enables the new bundle
@@ -50,7 +51,7 @@ does not select it, so enable the `@moguiyu/dsh-tavily` bundle on that page
 afterwards:
 
 ```bash
-dsh plugin --profile web add /absolute/path/to/moguiyu-dsh-tavily-0.7.0.tgz
+dsh plugin --profile web add /absolute/path/to/moguiyu-dsh-tavily-0.7.1.tgz
 ```
 
 `cordis.patch.yml` inserts the Host `dsh-tavily` row. It does not touch any preset.
@@ -84,6 +85,15 @@ carry the row; `chat-assistant` is deprecated there and intentionally has none:
 
 A subagent that omits a preset inherits its parent's composition, so it sees the parent's
 choice. An explicitly chosen preset brings its own.
+
+### DSH 0.2.2 executor migration
+
+0.2.2 moves tool presentation out of `dsh-tools`: the `mode` and `maxParallelSubCalls`
+keys are rejected, and the `tool-presentation` row is replaced by `tool-executor-native`
+or `tool-executor-ptc`. The Tavily `tavily-tools` row needs no change; in a PTC preset
+the four tools appear as `run_code` SDK bindings automatically. Migrate any other preset
+row that still writes the removed keys before enabling this package, and re-add the
+`tavily-tools` row if the upgrade rebuilds the profile.
 
 ## What the Plugins toggle controls
 
@@ -167,12 +177,20 @@ Both old packages are deprecated.
 
 ## DSH 0.2 compatibility
 
-Version **0.7.0** accepts the same DSH peers as 0.6.0 (`^0.2.0-0` and the earlier 0.1.x
-ranges). The 0.3.2 host regression baseline against **0.2.0-rc.2** — the compatibility gate,
-real tool execution, credential reads/writes and unload/reload — remains the baseline for this
-line. No version exemption is required.
+Version **0.7.1** keeps the 0.6.0 peer ranges and adds an explicit **0.2.2** line:
+`^0.2.2-0` covers every 0.2.2 prerelease and the final release, while the older
+`^0.2.0-0` and 0.1.x ranges remain. DSH evaluates these peer ranges with prereleases
+included, so no version exemption is required. The caret on 0.2.x also admits later
+0.2.x releases before 0.3.0.
+
+The 0.3.2 host regression baseline against **0.2.0-rc.2** — the compatibility gate,
+real tool execution, credential reads/writes, and unload/reload — remains the runtime
+baseline. The 0.2.2-alpha.3 check recorded in
+[the compatibility note](./docs/0.2.2-alpha.3-compatibility.md) is contract-level: the
+package was not booted on a real 0.2.2-alpha.3 instance.
 
 ## Documentation
 
 - [0.7.0 acceptance record](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.7.0-acceptance.md) (Chinese) — delivery shape, verification evidence, limitations, and rollback.
+- [0.2.2-alpha.3 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.2.2-alpha.3-compatibility.md) (Chinese) — 0.7.1 contract check, verification results, and unverified items.
 - [0.7.0 Host/preset split plan](https://github.com/moguiyu/dsh-tavily/blob/main/docs/preset-separation-upgrade-plan.md) (Chinese, historical) — the design record written before implementation.

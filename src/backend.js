@@ -207,7 +207,7 @@ export function warnIfNoKeys(ctx) {
   if (credentials === undefined || credentials === null) return
   collectStoredKeys(credentials).then(({ values }) => {
     if (values.length === 0) {
-      ctx.logger.warn('tavily_search: TAVILY_API_KEYS or TAVILY_API_KEY is not configured; add it via the Tavily Search settings card or ~/.dsh/.credentials.yaml')
+      ctx.logger.warn('tavily_search: TAVILY_API_KEYS or TAVILY_API_KEY is not configured; add it via the Tavily card on the Plugins page or ~/.dsh/.credentials.yaml')
     }
   }).catch((error) => {
     ctx.logger.warn('tavily_search: credential check failed: %s', error instanceof Error ? error.message : String(error))
