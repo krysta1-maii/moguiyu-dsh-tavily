@@ -21,6 +21,8 @@ The bundle and plugin entries use the bundled Tavily color icon from
   **0.1.6-alpha.2 or newer** — the release that retired `settings.plugin.item` and moved plugin
   configuration off the Settings page. On older lines the tools and routes work; there is simply
   no card.
+- **Locales** — `locale/*.json` supplies the Plugins-list title and description in the
+  eight shipped DSH languages; the card body itself remains English.
 - **`web_search` is never replaced** — no `ctx.web` provider is registered and
   `web.searchProvider` is never rewritten; the built-in `web_search` keeps its native provider
   and schema.
@@ -51,7 +53,7 @@ does not select it, so enable the `@moguiyu/dsh-tavily` bundle on that page
 afterwards:
 
 ```bash
-dsh plugin --profile web add /absolute/path/to/moguiyu-dsh-tavily-0.7.1.tgz
+dsh plugin --profile web add /absolute/path/to/moguiyu-dsh-tavily-0.8.0.tgz
 ```
 
 `cordis.patch.yml` inserts the Host `dsh-tavily` row. It does not touch any preset.
@@ -103,6 +105,15 @@ Stopping Tavily completely takes both steps:
 
 1. remove or disable the `tavily-tools` row in the presets;
 2. disable the Host `dsh-tavily` row, or deselect the bundle.
+
+## Remote access
+
+The two `/api/tavily-*` routes accept loopback requests only. A browser on another
+machine gets `403` from the card. To manage keys from a remote browser on a trusted
+network, launch dsh with `TAVILY_MANAGER_ALLOW_REMOTE=1`; that also exposes the
+key-reveal endpoint, so treat it as an explicit trust decision. A reverse proxy that
+forwards to the loopback address appears local to the Host; this guard is not an
+authentication layer.
 
 ## Call routing
 
@@ -168,7 +179,8 @@ npm run build      # regenerate lib/client.js from src/client.js
 Host half: plain ESM (`src/index.js`, `src/tools-entry.js`, `src/tools.js`,
 `src/backend.js`, `src/state.js`, `src/lib.js`). Client half: prebuilt
 `window.__ModuleLoader__` bundle at `lib/client.js`, generated from `src/client.js` via
-`npm run build`.
+`npm run build`. Plugin metadata lives in `locale/*.json`; the Plugins list reads
+those eight files without evaluating JavaScript.
 
 Earlier releases split this across `@moguiyu/dsh-tool-tavily-search` and
 `@moguiyu/dsh-tavily-backend`, which this package imported as regular dependencies. From 0.3.0
@@ -177,11 +189,15 @@ Both old packages are deprecated.
 
 ## DSH 0.2 compatibility
 
-Version **0.7.1** keeps the 0.6.0 peer ranges and adds an explicit **0.2.2** line:
+Version **0.8.0** keeps the 0.6.0 peer ranges and adds an explicit **0.2.2** line:
 `^0.2.2-0` covers every 0.2.2 prerelease and the final release, while the older
 `^0.2.0-0` and 0.1.x ranges remain. DSH evaluates these peer ranges with prereleases
 included, so no version exemption is required. The caret on 0.2.x also admits later
 0.2.x releases before 0.3.0.
+
+0.8.0 also adds the eight locale metadata files, limits the two management routes to
+loopback requests unless `TAVILY_MANAGER_ALLOW_REMOTE=1`, and aligns the development
+dependencies with 0.2.2-alpha.3.
 
 The 0.3.2 host regression baseline against **0.2.0-rc.2** — the compatibility gate,
 real tool execution, credential reads/writes, and unload/reload — remains the runtime
@@ -192,5 +208,5 @@ package was not booted on a real 0.2.2-alpha.3 instance.
 ## Documentation
 
 - [0.7.0 acceptance record](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.7.0-acceptance.md) (Chinese) — delivery shape, verification evidence, limitations, and rollback.
-- [0.2.2-alpha.3 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.2.2-alpha.3-compatibility.md) (Chinese) — 0.7.1 contract check, verification results, and unverified items.
+- [0.2.2-alpha.3 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.2.2-alpha.3-compatibility.md) (Chinese) — 0.7.1/0.8.0 contract check, verification results, and unverified items.
 - [0.7.0 Host/preset split plan](https://github.com/moguiyu/dsh-tavily/blob/main/docs/preset-separation-upgrade-plan.md) (Chinese, historical) — the design record written before implementation.

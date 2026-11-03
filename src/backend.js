@@ -16,6 +16,7 @@
  * either route, and `/api/tavily-manager` plus `/api/tavily-usage` exist
  * exactly once per Host.
  */
+import { isIP } from 'node:net'
 import { join } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { maskValue, parseKeyList, readJsonFile, reorderByMask } from './lib.js'
@@ -43,6 +44,32 @@ const MODES = new Set([MODE_PRIORITY, MODE_ROUND_ROBIN])
 
 const READONLY_LIST = 'TAVILY_API_KEYS is supplied read-only by the launching environment, so the key list cannot be changed here. Unset it in the shell you start dsh from, or manage keys in ~/.dsh/.credentials.yaml.'
 const READONLY_PRIMARY = 'That key comes from TAVILY_API_KEY, which the launching environment supplies read-only. Unset it in the shell you start dsh from.'
+
+/** Environment flag that opts into remote management on a trusted network. */
+const ALLOW_REMOTE_ENV = 'TAVILY_MANAGER_ALLOW_REMOTE'
+
+const REMOTE_DENIED = 'The Tavily management routes accept loopback requests only. Set TAVILY_MANAGER_ALLOW_REMOTE=1 in the environment that launches dsh to allow remote management.'
+
+/**
+ * Whether a socket address is this machine's loopback. IPv4-mapped IPv6
+ * addresses (`::ffff:127.0.0.1`) are normalized before the test.
+ */
+export function isLoopbackAddress(address) {
+  if (typeof address !== 'string') return false
+  const value = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address
+  return value === '::1' || (isIP(value) === 4 && value.startsWith('127.'))
+}
+
+/**
+ * Whether this request may use the key-management routes. The launching
+ * environment may opt in to remote management for a trusted network.
+ */
+export function mayManage(req) {
+  if (process.env[ALLOW_REMOTE_ENV] === '1') return true
+  const socket = req !== null && typeof req === 'object' ? req.socket : undefined
+  const address = socket !== null && typeof socket === 'object' ? socket.remoteAddress : undefined
+  return isLoopbackAddress(address)
+}
 
 function legacyStatePath() {
   return join(resolveDshHome(), LEGACY_STATE)
@@ -289,7 +316,8 @@ export function installBackend(ctx) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: '/api/tavily-usage',
-    handler: async (_req, res) => {
+    handler: async (req, res) => {
+      if (!mayManage(req)) return send(res, 403, { ok: false, error: REMOTE_DENIED })
       if (credentials === undefined) return send(res, 500, { ok: false, error: 'credentials service unavailable' })
       try {
         const { values: keys } = await collectStoredKeys(credentials)
@@ -347,6 +375,7 @@ export function installBackend(ctx) {
     kind: 'exact',
     path: '/api/tavily-manager',
     handler: async (req, res) => {
+      if (!mayManage(req)) return send(res, 403, { ok: false, error: REMOTE_DENIED })
       if (credentials === undefined) return send(res, 500, { ok: false, error: 'credentials service unavailable' })
       try {
         const url = new URL(req.url || '/', 'http://x')

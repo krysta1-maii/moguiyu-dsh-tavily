@@ -12,7 +12,7 @@ import { after, beforeEach, test } from 'node:test'
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-tavily-manager-'))
 after(() => rmSync(process.env.DSH_HOME, { recursive: true, force: true }))
 
-const { installBackend } = await import('../src/backend.js')
+const { installBackend, isLoopbackAddress } = await import('../src/backend.js')
 const { maskValue } = await import('../src/lib.js')
 const {
   entryFor,
@@ -71,10 +71,11 @@ function install(values, options = {}) {
   return { credentials, routes }
 }
 
-async function call(handler, method, body, path = '/api/tavily-manager') {
+async function call(handler, method, body, path = '/api/tavily-manager', address = '127.0.0.1') {
   const request = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))])
   request.method = method
   request.url = path
+  request.socket = { remoteAddress: address }
   const response = {
     statusCode: 0,
     payload: '',
@@ -115,6 +116,38 @@ async function withUsageFetch(handler, run) {
     globalThis.fetch = original
   }
 }
+
+test('loopback address detection covers IPv4, IPv6, and mapped forms', () => {
+  assert.equal(isLoopbackAddress('127.0.0.1'), true)
+  assert.equal(isLoopbackAddress('127.8.9.10'), true)
+  assert.equal(isLoopbackAddress('::1'), true)
+  assert.equal(isLoopbackAddress('::ffff:127.0.0.1'), true)
+  assert.equal(isLoopbackAddress('203.0.113.5'), false)
+  assert.equal(isLoopbackAddress('::ffff:203.0.113.5'), false)
+  assert.equal(isLoopbackAddress(undefined), false)
+})
+
+test('management routes refuse non-loopback requests', async () => {
+  const { routes } = install(KEYS)
+  for (const path of ['/api/tavily-manager', '/api/tavily-usage']) {
+    const res = await call(routes.get(path), 'GET', undefined, path, '203.0.113.5')
+    assert.equal(res.status, 403)
+    assert.match(res.body.error, /loopback/i)
+  }
+})
+
+test('TAVILY_MANAGER_ALLOW_REMOTE=1 opts into remote management', async () => {
+  const previous = process.env.TAVILY_MANAGER_ALLOW_REMOTE
+  process.env.TAVILY_MANAGER_ALLOW_REMOTE = '1'
+  try {
+    const { routes } = install(KEYS)
+    const res = await call(routes.get('/api/tavily-manager'), 'GET', undefined, '/api/tavily-manager', '203.0.113.5')
+    assert.equal(res.status, 200)
+  } finally {
+    if (previous === undefined) delete process.env.TAVILY_MANAGER_ALLOW_REMOTE
+    else process.env.TAVILY_MANAGER_ALLOW_REMOTE = previous
+  }
+})
 
 test('GET lists keys in stored priority order', async () => {
   const { routes } = install(KEYS)
