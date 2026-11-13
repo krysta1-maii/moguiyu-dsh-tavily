@@ -205,8 +205,23 @@ baseline. The 0.2.2-alpha.3 check recorded in
 [the compatibility note](./docs/0.2.2-alpha.3-compatibility.md) is contract-level: the
 package was not booted on a real 0.2.2-alpha.3 instance.
 
+The 0.2.2-rc.2 check reaches the same conclusion on the release that turned 0.2.2 into
+a semantic change. It also records that rc.2 keeps every interface this package uses
+intact, that `dshReleases` in `package.json` is documentation rather than a gate input,
+and that rc.2 was not published to npm on the check date, so no installation ran.
+
+The check against the 608 commits that follow `dsh-v0.2.2-rc.3` finds one breaking
+change: WebServer routes now default to `auth: 'required'`, so the two `/api/tavily-*`
+routes answer 503 in a composition without Connection and 401 to callers without a
+browser or API credential. Declaring `auth: 'anonymous'` on both registrations restores
+the current behavior and is ignored by rc.3 and earlier. The remaining interfaces this
+package uses keep their contracts; the client loader, the PTC transport, and Cordis
+changed around them without touching what this package calls.
+
 ## Documentation
 
 - [0.7.0 acceptance record](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.7.0-acceptance.md) (Chinese) — delivery shape, verification evidence, limitations, and rollback.
 - [0.2.2-alpha.3 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.2.2-alpha.3-compatibility.md) (Chinese) — 0.7.1/0.8.0 contract check, verification results, and unverified items.
+- [0.2.2-rc.2 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.2.2-rc.2-compatibility.md) (Chinese) — semantic-release check, behavioral changes, and the publication status of rc.2.
+- [Post-rc.3 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/post-rc.3-compatibility.md) (Chinese) — the unreleased commits after rc.3, the route-authentication gate, and the migration.
 - [0.7.0 Host/preset split plan](https://github.com/moguiyu/dsh-tavily/blob/main/docs/preset-separation-upgrade-plan.md) (Chinese, historical) — the design record written before implementation.
