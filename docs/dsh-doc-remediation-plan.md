@@ -1,8 +1,8 @@
 # dsh-tavily 规范整改施工计划
 
-- 日期：2026-11-21（施工核对与修订：2026-11-22）
-- 状态：施工中（WP0 已完成）
-- 当前项目版本：0.8.0（目标发布版本：0.9.0）
+- 日期：2026-11-21（施工完成：2026-11-22）
+- 状态：已完成（代码、86 项自动化测试与隔离 DSH 0.2.2-rc.5 冒烟通过；实机安装与浏览器人工验收项见 `0.9.0-acceptance.md`）
+- 当前项目版本：0.9.0（由 0.8.0 升级）
 - 施工基线：DeepSeek Harness 0.2.2-rc.5（`@deepseek-ai/cordis@4.1.0`）
 - 审查依据：用户提供的《dsh-tavily 插件规范审查报告》、当前项目源码、现有测试、当前安装的 DSH 文档与 Cordis Inspect 契约
 - 计划范围：管理路由认证与密钥回读、usage cache 生命周期、工具取消语义、状态文件读取错误
@@ -258,26 +258,26 @@ WP2、WP3、WP4 可以在 WP1 的接口夹具稳定后并行，但由同一施�
 
 ## 9. Definition of Done
 
-- [ ] WP0–WP5 全部完成，偏差已写入验收记录。
-- [ ] 管理路由全部经过 Connection 所有者认证，reveal 和认证绕过不存在。
-- [ ] 64 KiB 实际上限经过流式和固定长度测试。
-- [ ] usage cache 不持有完整 key，过期、凭据变化和卸载清理有效。
-- [ ] 普通与 quota probe 路径保留取消，timeout 独立。
-- [ ] 状态文件非 ENOENT 读取失败不会导致默认状态覆盖原文件。
-- [ ] 全部自动化检查通过，生成 Client 一致。
-- [ ] bundle 安装结果已核对，新会话工具与 Client Slot 已核对。
-- [ ] 浏览器保留功能通过，测试凭据和临时状态已清理。
-- [ ] README、兼容声明、升级说明和验收记录已更新。
-- [ ] 真实 Tavily、native/PTC 取消、代理或桌面端未覆盖项已明确列出。
-- [ ] 回滚步骤可执行，工作树只包含预期改动。
+- [x] WP0–WP5 全部完成，偏差（`POST /api/tavily-manager/update` 流式路径拆分）已写入验收记录。
+- [x] 管理路由全部经过 Connection 所有者认证，reveal 和认证绕过不存在。
+- [x] 64 KiB 实际上限经过流式和固定长度测试。
+- [x] usage cache 不持有完整 key，过期、凭据变化和卸载清理有效。
+- [x] 普通与 quota probe 路径保留取消，timeout 独立（`TAVILY_TIMEOUT`），并经真实 native 工具管线验证。
+- [x] 状态文件非 ENOENT 读取失败不会导致默认状态覆盖原文件。
+- [x] 全部自动化检查通过（`npm run build`、`npm run check`、`npm test` 86/86），生成 Client 一致。
+- [x] 隔离 DSH `0.2.2-rc.5` 环境已通过 `pluginManager/installBundle` 安装并核对 `application: "applied"` 与零 warnings；实机 `web` profile 安装与新会话 Tool/Slot Inspect 留待发布窗口人工核对（已记入验收记录未覆盖项）。
+- [ ] 实机浏览器保留功能人工点击核对（无自动化浏览器控制，已记入验收记录未覆盖项）。
+- [x] README、兼容声明、升级说明和验收记录已更新。
+- [x] 真实 Tavily、PTC 沙箱取消、代理、桌面端及实机浏览器未覆盖项已明确列出。
+- [x] 回滚步骤可执行，工作树只包含预期改动。
 
 ## 10. 施工记录
 
 | 工作包 | 提交 / 结果 | 验证证据 | 状态 |
 | --- | --- | --- | --- |
-| WP0 | 基线提交 `442c99c`，依赖与兼容范围对齐 DSH `0.2.2-rc.5` / Cordis `4.1.0`，修订 WP1.1 路由拆分契约，建立 `0.9.0` 验收草案 | 本机 DSH `0.2.2-rc.5`、8 个核心源文件 SHA-256 与 `~/.dsh-local-plugins/dsh-tavily` 一致；`npm install --no-package-lock`、`npm run check`、`npm test` 69/69 通过 | 已完成 |
-| WP1 | 待填写 | 待填写 | 待施工 |
-| WP2 | 待填写 | 待填写 | 待施工 |
-| WP3 | 待填写 | 待填写 | 待施工 |
-| WP4 | 待填写 | 待填写 | 待施工 |
-| WP5 | 待填写 | 待填写 | 待施工 |
+| WP0 | `f9f750b`：冻结 `442c99c` 基线，依赖与兼容范围对齐 DSH `0.2.2-rc.5` / Cordis `4.1.0`，修订 WP1.1 路由拆分契约，建立 `0.9.0` 验收草案 | 本机 DSH `0.2.2-rc.5`、8 个核心文件 SHA-256 与 `~/.dsh-local-plugins/dsh-tavily` 一致；`npm run check`、`npm test` 69/69 通过 | 已完成 |
+| WP1 | `6372b1a`：管理路由迁入 `ctx.connection.fetch`（`GET /api/tavily-manager`、`POST /api/tavily-manager/update`、`GET /api/tavily-usage`），实施流式 64 KiB body 上限，移除 `reveal` 与 `TAVILY_MANAGER_ALLOW_REMOTE`，重建 `lib/client.js` | `npm run build`、`npm run check`、`npm test` 72/72 通过（含真实 `dsh-client-connection` 认证、非 owner 403、流式 413、异步卸载重挂载测试） | 已完成 |
+| WP2 | `ff505ff`：usage cache 收拢至 Host 安装域，改用 `keyId` 指纹键，刷新前淘汰过期与已删除项，凭据变更、`credentials/reference-updated` 与 Host 卸载均清空 | `npm run check`、`npm test` 75/75 通过 | 已完成 |
+| WP3 | `cf9507a`：重构 `combineSignals` 传播调用者 `exec.signal.reason`，区分 `HarnessError(..., 'TAVILY_TIMEOUT')`，修复 failover 与 `probeOldestBlocked` 取消路径及资源清理 | `npm run check`、`npm test` 82/82 通过（含真实 `ToolsService` + `NativeToolExecutor` 管线 `ABORTED` vs `TAVILY_TIMEOUT` 验证） | 已完成 |
+| WP4 | `90b95c4`：新增严格 JSON 对象读取，非 `ENOENT` 失败抛 `TAVILY_STATE_INVALID` / `TAVILY_STATE_READ_FAILED`，POST 预检阻止写凭据，绝不覆写损坏/不可读原文件 | `npm run check`、`npm test` 86/86 通过 | 已完成 |
+| WP5 | 版本号升至 `0.9.0`，更新 `README.md`、`docs/0.9.0-acceptance.md`、`docs/README.md` 与本文，重建 `lib/client.js` | `npm run build`、`npm run check`、`npm test` 86/86、`npm pack --dry-run` 与隔离 DSH `0.2.2-rc.5` `pluginManager/installBundle` 端到端冒烟全部通过 | 已完成 |

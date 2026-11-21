@@ -330,7 +330,7 @@ export function factory(require) {
       react.createElement('style', null, '.dts-icon-btn:hover{background:var(--dsw-alias-interactive-bg-hover)}.dts-icon-btn:disabled{opacity:.4;cursor:default}.dts-icon-btn-danger:hover{background:var(--dsw-alias-interactive-bg-hover-danger)}'),
       react.createElement(react.Fragment, null,
               react.createElement('p', { style: { margin: 0, fontSize: 13, color: 'var(--dsw-alias-label-tertiary)' } },
-                'This card manages keys, call order, and availability for every preset at once. Whether an agent receives the Tavily tools is decided by its own preset, which mounts @moguiyu/dsh-tavily/tools; disabling this Host plugin row removes only this card and its two management routes, never a preset\'s tools.'
+                'This card manages keys, call order, and availability for every preset at once. Whether an agent receives the Tavily tools is decided by its own preset, which mounts @moguiyu/dsh-tavily/tools; disabling this Host plugin row removes only this card and its management routes, never a preset\'s tools.'
               ),
               react.createElement('p', { style: { margin: 0, fontSize: 13, color: 'var(--dsw-alias-label-tertiary)' } },
                 'Keys are used in the order shown. A 401/429/432/433 response tries the next active key for that call; 432/433 also turns that key off until its quota falls below 40%. Built-in web_search is unaffected.'

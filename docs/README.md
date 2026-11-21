@@ -9,7 +9,7 @@
 | [0.2.2-rc.2 兼容性核对](./0.2.2-rc.2-compatibility.md) | 现行 | 0.8.0 对 DSH 0.2.2-rc.2 的契约核对与 rc.2 引入的行为变化 |
 | [rc.3 之后未发布提交的兼容性核对](./post-rc.3-compatibility.md) | 现行 | 0.8.0 对 DSH rc.3 之后 608 个未发布提交的核对；结论为 WebServer 路由认证门禁构成破坏 |
 | [Host / preset 分离施工计划](./preset-separation-upgrade-plan.md) | 历史 | 升级前的设计依据与施工步骤；正文保留计划阶段判断，实际差异以验收记录为准 |
-| [DSH 规范整改施工计划](./dsh-doc-remediation-plan.md) | 施工中 | 基于 0.2.2-rc.5 的 Connection 管理路由、usage cache、取消语义和状态文件整改；包含验收、发布与回滚 |
-| [0.9.0 验收记录](./0.9.0-acceptance.md) | 草案 | 0.9.0 规范整改基线、0.2.2-rc.5 契约核对、验证边界与验收结果 |
+| [DSH 规范整改施工计划](./dsh-doc-remediation-plan.md) | 已完成 | 基于 0.2.2-rc.5 的 Connection 管理路由、usage cache、取消语义和状态文件整改；包含契约修订、施工记录、发布与回滚 |
+| [0.9.0 验收记录](./0.9.0-acceptance.md) | 现行 | 0.9.0 规范整改基线、0.2.2-rc.5 契约核对、自动化与隔离运行态验收证据、未覆盖项与回滚 |
 
-0.7.0 已验收通过。0.7.1 保持 Host / preset 双入口与工具行为不变，补充 0.2.2 版本声明，删除失效的 `./invariant` 出口，并校正卡片位置文案。0.8.0 增加 8 种语言的插件元数据，把两条管理路由默认限制为回环访问，并把开发依赖对齐到 0.2.2-alpha.3。当前 `web` profile 中，`standard-instant`、`ptc-instant`、`cordis-ptc` 三个 preset 挂载 `@moguiyu/dsh-tavily/tools`；`chat-assistant` 已废弃，不挂载；Host 行只提供管理卡片与两条管理路由。
+0.7.0 已验收通过。0.7.1 保持 Host / preset 双入口与工具行为不变，补充 0.2.2 版本声明，删除失效的 `./invariant` 出口，并校正卡片位置文案。0.8.0 增加 8 种语言的插件元数据，把两条管理路由默认限制为回环访问，并把开发依赖对齐到 0.2.2-alpha.3。0.9.0 基于 DSH `0.2.2-rc.5` 完成规范整改：管理路由迁入 `ctx.connection.fetch`（拆出流式 64 KiB 上限的 `POST /api/tavily-manager/update`），移除 `reveal` 与 `TAVILY_MANAGER_ALLOW_REMOTE`，收拢 usage cache 至 Host 实例域并以指纹为键，保留工具调用者取消 reason 并区分 `TAVILY_TIMEOUT`，并将状态文件读取改为严格 fail-fast。当前 `web` profile 中，`standard-instant`、`ptc-instant`、`cordis-ptc` 三个 preset 挂载 `@moguiyu/dsh-tavily/tools`；`chat-assistant` 已废弃，不挂载；Host 行只提供管理卡片与管理路由。

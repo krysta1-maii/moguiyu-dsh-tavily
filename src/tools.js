@@ -169,7 +169,7 @@ async function callOperation(operation, body, key, exec, timeoutMs) {
         authorization: 'Bearer ' + key,
         // Keep in step with package.json "version"; test/entries.test.js
         // asserts the two match.
-        'user-agent': 'dsh-tool-tavily-search/0.8.0',
+        'user-agent': 'dsh-tool-tavily-search/0.9.0',
       },
       body: JSON.stringify(body),
       signal: combined.signal,

@@ -1,6 +1,6 @@
 {
   "name": "@moguiyu/dsh-tavily",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Advanced Tavily model tools for DeepSeek Harness (tavily_search, tavily_extract, tavily_map, tavily_crawl) with a key, call-order, and availability management card on the Plugins page. Agent presets mount @moguiyu/dsh-tavily/tools to receive the tools; the Host row alone carries only the card and its routes. The built-in web_search is never replaced.",
   "icon": "./icon.svg",
   "type": "module",

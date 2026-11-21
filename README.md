@@ -1,10 +1,10 @@
 # @moguiyu/dsh-tavily
 
 Advanced Tavily tools and key management for DeepSeek Harness, in one package with two
-entries: the Host entry carries the **Plugins** page card and its two HTTP routes, and the
-`@moguiyu/dsh-tavily/tools` entry carries the model tools. An agent preset mounts the tools
-entry, so each preset decides whether its agents see `tavily_search`, `tavily_extract`,
-`tavily_map`, and `tavily_crawl`.
+entries: the Host entry carries the **Plugins** page card and its Connection Fetch
+management routes, and the `@moguiyu/dsh-tavily/tools` entry carries the model tools. An
+agent preset mounts the tools entry, so each preset decides whether its agents see
+`tavily_search`, `tavily_extract`, `tavily_map`, and `tavily_crawl`.
 
 The bundle and plugin entries use the bundled Tavily color icon from
 [Lobe Icons](https://github.com/lobehub/lobe-icons). See
@@ -14,13 +14,11 @@ The bundle and plugin entries use the bundled Tavily color icon from
   `include_answer`, `include_raw_content`, `include_domains`, `exclude_domains`).
 - **`tavily_extract` / `tavily_map` / `tavily_crawl`** — read a known URL's content, map a
   site's links, or crawl a site and return its pages. Same call order and failover as search.
-- **Card** — key list in stored order, usage gauge, up/down controls, a priority/round-robin
-  switch, and per-key availability tags. Only active keys are used; a 432/433 response turns
-  a key off until a usage refresh sees that limit below 40%. It registers into the Plugins
-  page's `plugins.bundle.config` slot, keyed `@moguiyu/dsh-tavily`, and needs DSH
-  **0.1.6-alpha.2 or newer** — the release that retired `settings.plugin.item` and moved plugin
-  configuration off the Settings page. On older lines the tools and routes work; there is simply
-  no card.
+- **Card** — key list in stored order (masked fingerprints only; full-key reveal is removed
+  in 0.9.0), usage gauge, up/down controls, a priority/round-robin switch, replace/delete
+  controls, and per-key availability tags. Only active keys are used; a 432/433 response
+  turns a key off until a usage refresh sees that limit below 40%. It registers into the
+  Plugins page's `plugins.bundle.config` slot, keyed `@moguiyu/dsh-tavily`.
 - **Locales** — `locale/*.json` supplies the Plugins-list title and description in the
   eight shipped DSH languages; the card body itself remains English.
 - **`web_search` is never replaced** — no `ctx.web` provider is registered and
@@ -31,20 +29,21 @@ The bundle and plugin entries use the bundled Tavily color icon from
 
 | Entry | Where it runs | What it registers |
 | --- | --- | --- |
-| `@moguiyu/dsh-tavily` | Host Loader row in `cordis.patch.yml` | `/api/tavily-usage`, `/api/tavily-manager`, the Client card carrier, one startup warning when no key is configured |
+| `@moguiyu/dsh-tavily` | Host Loader row in `cordis.patch.yml` | Connection Fetch routes (`GET /api/tavily-usage`, `GET /api/tavily-manager`, `POST /api/tavily-manager/update`), the Host-owned usage cache, the Client card carrier, one startup warning when no key is configured |
 | `@moguiyu/dsh-tavily/tools` | A row in an agent preset's `config.plugins` | `tavily_search`, `tavily_extract`, `tavily_map`, `tavily_crawl`, the `tool:tavily_search` and `tool:tavily_direct` prompt sections, and that installation's round-robin cursor |
 
 The split exists because the two halves have opposite placement rules. Tools registered from
 the Host row are visible to every preset, including `minimal` and the shipped templates. Routes
-cannot move into a preset: `ctx.webServer.register` throws on a duplicate exact path, so the
-second preset to mount the same row would be marked broken. The Client card cannot move either:
-`dsh-client-modules` only scans Host Loader entries for a `dsh.client` declaration.
+cannot move into a preset: `ctx.connection.fetch.register` throws on a duplicate exact path,
+so the second preset to mount the same row would be marked broken. The Client card cannot move
+either: `dsh-client-modules` only scans Host Loader entries for a `dsh.client` declaration.
 
 ## Install
 
-The Plugins card needs DSH **0.1.6-alpha.2 or newer**; on older 0.1.x lines the tools
-and routes still load, without a card. The package code runs on Node.js 22 or newer;
-paired with DSH **0.2.2**, use Node.js **24.9 or newer**, the runtime's own floor.
+Version **0.9.0** requires DeepSeek Harness **0.2.2-rc.5 or newer** (with `@deepseek-ai/cordis`
+`^4.1.0` and `@deepseek-ai/dsh-error` `^0.2.2-rc.5`) and Node.js **24.9 or newer** (the DSH
+0.2.2 runtime floor; the package's own `engines` floor remains Node.js 22+). Older DSH releases
+should stay on `@moguiyu/dsh-tavily@0.8.0`.
 
 Install through **Plugins → Add plugin** in the Web UI, naming the absolute path of
 the package tarball or of an unpacked checkout; the manager enables the new bundle
@@ -53,7 +52,7 @@ does not select it, so enable the `@moguiyu/dsh-tavily` bundle on that page
 afterwards:
 
 ```bash
-dsh plugin --profile web add /absolute/path/to/moguiyu-dsh-tavily-0.8.0.tgz
+dsh plugin --profile web add /absolute/path/to/moguiyu-dsh-tavily-0.9.0.tgz
 ```
 
 `cordis.patch.yml` inserts the Host `dsh-tavily` row. It does not touch any preset.
@@ -100,20 +99,66 @@ row that still writes the removed keys before enabling this package, and re-add 
 ## What the Plugins toggle controls
 
 The Host row's toggle in the Plugins page controls the management surface only: the card, the
-two `/api` routes, and the startup key check. It does not add or remove any preset's tools.
-Stopping Tavily completely takes both steps:
+Connection Fetch `/api` routes, the usage cache, and the startup key check. It does not add or
+remove any preset's tools. Stopping Tavily completely takes both steps:
 
 1. remove or disable the `tavily-tools` row in the presets;
 2. disable the Host `dsh-tavily` row, or deselect the bundle.
 
-## Remote access
+## Authentication, remote access, and security
 
-The two `/api/tavily-*` routes accept loopback requests only. A browser on another
-machine gets `403` from the card. To manage keys from a remote browser on a trusted
-network, launch dsh with `TAVILY_MANAGER_ALLOW_REMOTE=1`; that also exposes the
-key-reveal endpoint, so treat it as an explicit trust decision. A reverse proxy that
-forwards to the loopback address appears local to the Host; this guard is not an
-authentication layer.
+From **0.9.0**, all three management routes are registered via `ctx.connection.fetch.register()`:
+
+- `GET /api/tavily-manager` (`requestBody: 'buffered'`) — returns masked key fingerprints,
+  call mode, writability flags, and per-key availability.
+- `POST /api/tavily-manager/update` (`requestBody: 'streaming'`) — mutates keys, order, mode,
+  or availability. Uses streaming body reading with a strict **64 KiB** limit (`413` on
+  overflow, `415` on non-`application/json`, `400` on invalid JSON).
+- `GET /api/tavily-usage` (`requestBody: 'buffered'`) — refreshes per-key usage and reconciles
+  432/433 quota blocks; upstream Tavily requests honor client disconnect (`request.signal`).
+
+Security invariants:
+
+- **Connection owner-only auth** — DSH Connection enforces Host/Origin trust, browser/API
+  authentication, and `peer.principal.kind === 'owner'` before any handler executes. Anonymous
+  requests receive `401`; cross-origin or non-owner requests receive `403`.
+- **`TAVILY_MANAGER_ALLOW_REMOTE` removed** — the custom remote bypass environment variable
+  from 0.8.0 is deleted. Remote reachability is governed exclusively by DSH's listener bind
+  address, `trustedHosts`, TLS, and Connection owner authentication.
+- **No full-key reveal** — the `?reveal=` query branch and the card's Show/Hide eye control
+  are deleted. No management, usage, or error response returns a raw API key. To rotate a key,
+  use the **Edit** (replace) control.
+- **Scoped usage cache** — the 60-second usage cache belongs to the Host plugin instance, is
+  keyed by 16-hex SHA-256 fingerprints (`keyId`) rather than raw keys, actively evicts expired
+  and removed entries, invalidates on credential mutations and `credentials/reference-updated`,
+  and clears on Host unload.
+
+## State file safety and manual recovery
+
+Routing state lives in `~/.dsh/tavily-manager.json` (containing no secrets) and is written
+atomically via temporary file + `rename`. From **0.9.0**, reads are strict:
+
+- Only `ENOENT` (missing file) initializes default state.
+- Corrupt JSON or a non-object JSON root fails fast with `TAVILY_STATE_INVALID`.
+- Permission or I/O errors fail fast with `TAVILY_STATE_READ_FAILED`.
+- Error messages include the state file path and error code, never file contents or secrets.
+- Failed state reads never overwrite `~/.dsh/tavily-manager.json`, and `POST
+  /api/tavily-manager/update` runs a state-read preflight before any `credentials.set`/`unset`.
+
+**Manual recovery** if `~/.dsh/tavily-manager.json` becomes damaged or unreadable:
+
+1. Keep the damaged file in place first; check file permissions and JSON syntax.
+2. Back up the damaged file if you need to inspect its mode or disabled-key records.
+3. Fix the JSON/permissions in place, or move the backed-up damaged file out of `~/.dsh/` so
+   the next operation recreates a clean default state file.
+
+## Cancellation and timeout behavior
+
+Tool calls propagate caller cancellation (`exec.signal.reason`) verbatim across normal
+requests, failover loops, and quota-blocked probes so the DSH tool pipeline classifies caller
+cancellation as `ABORTED` and immediately stops trying further keys. An upstream timeout on
+Tavily itself throws a `HarnessError` with code `TAVILY_TIMEOUT`, kept distinct from caller
+cancellation.
 
 ## Call routing
 
@@ -187,41 +232,46 @@ Earlier releases split this across `@moguiyu/dsh-tool-tavily-search` and
 both are folded in here: one package means no dependency range can drift behind the contract.
 Both old packages are deprecated.
 
-## DSH 0.2 compatibility
+## Upgrade from 0.8.0 and rollback
 
-Version **0.8.0** keeps the 0.6.0 peer ranges and adds an explicit **0.2.2** line:
-`^0.2.2-0` covers every 0.2.2 prerelease and the final release, while the older
-`^0.2.0-0` and 0.1.x ranges remain. DSH evaluates these peer ranges with prereleases
-included, so no version exemption is required. The caret on 0.2.x also admits later
-0.2.x releases before 0.3.0.
+**0.9.0** is an intentional security and contract update targeting DSH **0.2.2-rc.5**:
 
-0.8.0 also adds the eight locale metadata files, limits the two management routes to
-loopback requests unless `TAVILY_MANAGER_ALLOW_REMOTE=1`, and aligns the development
-dependencies with 0.2.2-alpha.3.
+- Management routes move from `ctx.webServer` to `ctx.connection.fetch` (owner-only auth).
+- Management writes move from `POST /api/tavily-manager` to `POST /api/tavily-manager/update`
+  with a 64 KiB streaming body cap (updated in `lib/client.js`; refresh the browser page after
+  upgrading).
+- `TAVILY_MANAGER_ALLOW_REMOTE` and full-key reveal (`?reveal=` / eye button) are removed.
+- `~/.dsh/tavily-manager.json` fails fast instead of silently resetting on read/parse errors.
 
-The 0.3.2 host regression baseline against **0.2.0-rc.2** — the compatibility gate,
-real tool execution, credential reads/writes, and unload/reload — remains the runtime
-baseline. The 0.2.2-alpha.3 check recorded in
-[the compatibility note](./docs/0.2.2-alpha.3-compatibility.md) is contract-level: the
-package was not booted on a real 0.2.2-alpha.3 instance.
+Upgrade steps:
 
-The 0.2.2-rc.2 check reaches the same conclusion on the release that turned 0.2.2 into
-a semantic change. It also records that rc.2 keeps every interface this package uses
-intact, that `dshReleases` in `package.json` is documentation rather than a gate input,
-and that rc.2 was not published to npm on the check date, so no installation ran.
+1. Back up `~/.dsh/tavily-manager.json` (no secrets are stored in this file).
+2. Install `@moguiyu/dsh-tavily@0.9.0` via **Plugins** (`plugin_manager`) and verify
+   `application: "applied"` with no warnings.
+3. Refresh the browser page to pick up the rebuilt `lib/client.js`.
 
-The check against the 608 commits that follow `dsh-v0.2.2-rc.3` finds one breaking
-change: WebServer routes now default to `auth: 'required'`, so the two `/api/tavily-*`
-routes answer 503 in a composition without Connection and 401 to callers without a
-browser or API credential. Declaring `auth: 'anonymous'` on both registrations restores
-the current behavior and is ignored by rc.3 and earlier. The remaining interfaces this
-package uses keep their contracts; the client loader, the PTC transport, and Cordis
-changed around them without touching what this package calls.
+Rollback to `0.8.0`:
+
+1. Restore `0.8.0` via `plugin_manager` (do not hand-edit profile files).
+2. Normal `~/.dsh/tavily-manager.json` and credentials schemas are unchanged and readable by
+   `0.8.0`.
+3. **Caution**: if rolling back because `~/.dsh/tavily-manager.json` is corrupt or unreadable,
+   back up and fix/move the file first — `0.8.0` silently resets corrupt state on write.
+
+## DSH 0.2.2-rc.5 compatibility
+
+Version **0.9.0** declares compatibility exclusively with the verified **0.2.2-rc.5** line
+(`dsh.compatibility.dshReleases: { "0.2.2-rc.5": "compatible" }`, `@deepseek-ai/cordis@^4.1.0`,
+`@deepseek-ai/dsh-error@^0.2.2-rc.5`, `@deepseek-ai/dsh-home-paths@^0.2.2-rc.5`,
+`@deepseek-ai/dsh-tools@^0.2.2-rc.5`). Earlier DSH releases that lack `ctx.connection.fetch`
+should stay on `@moguiyu/dsh-tavily@0.8.0`.
 
 ## Documentation
 
+- [0.9.0 acceptance record](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.9.0-acceptance.md) (Chinese) — 0.2.2-rc.5 contract checks, automated & isolated runtime evidence, uncovered items, and rollback.
+- [DSH remediation plan](https://github.com/moguiyu/dsh-tavily/blob/main/docs/dsh-doc-remediation-plan.md) (Chinese) — WP0–WP5 execution plan, contract revision, DoD checklist, and commit log.
 - [0.7.0 acceptance record](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.7.0-acceptance.md) (Chinese) — delivery shape, verification evidence, limitations, and rollback.
 - [0.2.2-alpha.3 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.2.2-alpha.3-compatibility.md) (Chinese) — 0.7.1/0.8.0 contract check, verification results, and unverified items.
 - [0.2.2-rc.2 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/0.2.2-rc.2-compatibility.md) (Chinese) — semantic-release check, behavioral changes, and the publication status of rc.2.
-- [Post-rc.3 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/post-rc.3-compatibility.md) (Chinese) — the unreleased commits after rc.3, the route-authentication gate, and the migration.
+- [Post-rc.3 compatibility note](https://github.com/moguiyu/dsh-tavily/blob/main/docs/post-rc.3-compatibility.md) (Chinese) — historical note on the unreleased commits after rc.3 that motivated the Connection migration.
 - [0.7.0 Host/preset split plan](https://github.com/moguiyu/dsh-tavily/blob/main/docs/preset-separation-upgrade-plan.md) (Chinese, historical) — the design record written before implementation.
