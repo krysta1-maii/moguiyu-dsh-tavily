@@ -25,6 +25,7 @@
  * the usage cache stay shared on purpose: changing the call order or a key's
  * availability in the card applies to every preset's next call.
  */
+import { HarnessError } from '@deepseek-ai/dsh-error'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { parseKeyList } from './lib.js'
 import {
@@ -38,6 +39,7 @@ import {
 } from './state.js'
 
 const TAVILY_BASE_URL = 'https://api.tavily.com'
+export const TAVILY_TIMEOUT_CODE = 'TAVILY_TIMEOUT'
 
 /**
  * Statuses that mean "this key cannot serve the request, the next one might":
@@ -82,20 +84,56 @@ function hostnameOf(url) {
   }
 }
 
-/** Combine a caller signal with a hard timeout; call dispose() after the request. */
-function combineSignals(signal, ms) {
+function callerAbortReason(signal) {
+  return signal.reason !== undefined
+    ? signal.reason
+    : new DOMException('The operation was aborted.', 'AbortError')
+}
+
+function isTavilyTimeoutError(error) {
+  return error instanceof HarnessError && error.code === TAVILY_TIMEOUT_CODE
+}
+
+/**
+ * Combine a caller signal with a hard timeout; call dispose() after the request.
+ * Caller cancellation propagates `signal.reason` verbatim, while own timeout
+ * uses a dedicated `HarnessError` with code `TAVILY_TIMEOUT` so the tool
+ * pipeline can separate caller ABORTED from an upstream timeout.
+ */
+export function combineSignals(signal, ms, operation = 'search') {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), ms)
-  const onAbort = () => controller.abort()
-  if (signal !== undefined && signal !== null) {
-    if (signal.aborted) controller.abort()
-    else signal.addEventListener('abort', onAbort, { once: true })
+  const timeoutError = new HarnessError(`tavily_${operation}: request timed out after ${ms}ms`, TAVILY_TIMEOUT_CODE)
+  let timedOut = false
+  let timer = null
+  let listening = false
+  const onAbort = () => {
+    controller.abort(callerAbortReason(signal))
+  }
+  if (signal !== undefined && signal !== null && signal.aborted) {
+    controller.abort(callerAbortReason(signal))
+  } else {
+    timer = setTimeout(() => {
+      timedOut = true
+      controller.abort(timeoutError)
+    }, ms)
+    if (signal !== undefined && signal !== null) {
+      listening = true
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
   }
   return {
     signal: controller.signal,
+    timeoutError,
+    didTimeout: () => timedOut,
     dispose() {
-      clearTimeout(timer)
-      if (signal !== undefined && signal !== null) signal.removeEventListener('abort', onAbort)
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      if (listening && signal !== undefined && signal !== null) {
+        listening = false
+        signal.removeEventListener('abort', onAbort)
+      }
     },
   }
 }
@@ -119,7 +157,9 @@ function buildBody(input) {
 
 /** POST to `https://api.tavily.com/<operation>`; returns a normalized outcome. */
 async function callOperation(operation, body, key, exec, timeoutMs) {
-  const combined = combineSignals(exec.signal, timeoutMs)
+  const callerSignal = exec?.signal
+  if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
+  const combined = combineSignals(callerSignal, timeoutMs, operation)
   try {
     const response = await fetch(`${TAVILY_BASE_URL}/${operation}`, {
       method: 'POST',
@@ -134,6 +174,7 @@ async function callOperation(operation, body, key, exec, timeoutMs) {
       body: JSON.stringify(body),
       signal: combined.signal,
     })
+    if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
     if (RETRYABLE_STATUSES.has(response.status)) {
       return { kind: 'retryable', statusCode: response.status }
     }
@@ -152,8 +193,9 @@ async function callOperation(operation, body, key, exec, timeoutMs) {
     }
     return { kind: 'ok', statusCode: response.status, json: await response.json() }
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error(`tavily_${operation}: request timed out or was aborted`)
+    if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
+    if (combined.didTimeout() || error === combined.timeoutError || isTavilyTimeoutError(error)) {
+      throw combined.timeoutError
     }
     throw error
   } finally {
@@ -459,7 +501,13 @@ const NAVIGATION_PARAMETERS = {
  * No web search provider is registered here: `web_search` keeps its native
  * provider and `ctx.web` is never touched.
  */
-export function installTavilyTool(ctx) {
+export function installTavilyTool(ctx, options = {}) {
+  const timeouts = {
+    search: options.timeouts?.search ?? 30000,
+    extract: options.timeouts?.extract ?? 60000,
+    map: options.timeouts?.map ?? 60000,
+    crawl: options.timeouts?.crawl ?? 120000,
+  }
   // Every registration is collected into one disposer so the fiber tears the
   // half down cleanly: on row unload, and on the Plugins page's runtime unload
   // of the bundle (0.1.6-alpha.2 unloads without restarting anything).
@@ -526,6 +574,8 @@ export function installTavilyTool(ctx) {
    * forever. Manually disabled keys are never probed.
    */
   async function probeOldestBlocked(operation, body, timeoutMs, exec, entries, source) {
+    const callerSignal = exec?.signal
+    if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
     const state = readState()
     const candidate = entries
       .map((entry) => ({ ...entry, state: entryFor(state, entry.id) }))
@@ -538,6 +588,8 @@ export function installTavilyTool(ctx) {
     try {
       outcome = await callOperation(operation, body, candidate.key, exec, timeoutMs)
     } catch (error) {
+      if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
+      if (isTavilyTimeoutError(error)) throw error
       throw new Error(`tavily_${operation}: no active keys; the quota-blocked probe failed: ${error instanceof Error ? error.message : String(error)}`)
     }
     if (outcome.kind === 'ok') {
@@ -571,7 +623,10 @@ export function installTavilyTool(ctx) {
    * and 432/433 also records a quota block for later calls.
    */
   async function requestWithFailover(operation, body, timeoutMs, exec, detail) {
+    const callerSignal = exec?.signal
+    if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
     const { keys, source } = await resolveKeys()
+    if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
     if (keys.length === 0) {
       throw new Error(`tavily_${operation}: TAVILY_API_KEYS or TAVILY_API_KEY is not configured — add it via the Tavily card on the Plugins page or ~/.dsh/.credentials.yaml (comma-separated)`)
     }
@@ -591,6 +646,7 @@ export function installTavilyTool(ctx) {
     let lastStatus = 0
     let attempted = 0
     for (const item of order) {
+      if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
       if (state.mode === MODE_ROUND_ROBIN) rotation.cursor = item.id
       attempted++
       const started = Date.now()
@@ -610,6 +666,7 @@ export function installTavilyTool(ctx) {
         }
       }
       ctx.logger.info(`tavily_${operation}: key %d/%d returned HTTP %d%s`, attempted, order.length, outcome.statusCode, reason !== undefined ? '; disabled until usage recovers' : '')
+      if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
     }
     throw new Error(`tavily_${operation}: all ${attempted} attempted key(s) failed with HTTP ${lastStatus} (invalid key, rate limit, or quota exhausted)`)
   }
@@ -654,11 +711,11 @@ export function installTavilyTool(ctx) {
       },
       render: (_args, value) => [{ type: 'text', text: formatOutput(value) }],
     },
-    timeoutMs: 30000,
+    timeoutMs: timeouts.search,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const input = normalizeArgs(args)
-      const json = await requestWithFailover('search', buildBody(input), 30000, exec, (j) => ({
+      const json = await requestWithFailover('search', buildBody(input), timeouts.search, exec, (j) => ({
         query: input.query,
         results: Array.isArray(j.results) ? j.results.length : 0,
       }))
@@ -678,10 +735,10 @@ export function installTavilyTool(ctx) {
       query: { type: 'string', description: 'Optional intent used to rank extracted chunks by relevance.' },
     },
     output: { schema: EXTRACT_OUTPUT_SCHEMA, render: renderJson },
-    timeoutMs: 60000,
+    timeoutMs: timeouts.extract,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const json = await requestWithFailover('extract', buildExtractBody(normalizeExtractArgs(args)), 60000, exec)
+      const json = await requestWithFailover('extract', buildExtractBody(normalizeExtractArgs(args)), timeouts.extract, exec)
       return projectExtract(json)
     },
   }))
@@ -691,10 +748,10 @@ export function installTavilyTool(ctx) {
     description: 'Discover URLs in a website through Tavily without extracting their page content. Use it to inspect site structure before selecting pages to extract or crawl.',
     parameters: NAVIGATION_PARAMETERS,
     output: { schema: MAP_OUTPUT_SCHEMA, render: renderJson },
-    timeoutMs: 60000,
+    timeoutMs: timeouts.map,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const json = await requestWithFailover('map', buildNavBody(normalizeNavArgs(args, { crawl: false })), 60000, exec)
+      const json = await requestWithFailover('map', buildNavBody(normalizeNavArgs(args, { crawl: false })), timeouts.map, exec)
       return projectMap(json)
     },
   }))
@@ -710,10 +767,10 @@ export function installTavilyTool(ctx) {
       chunks_per_source: { type: 'number', description: 'Maximum extracted chunks returned per crawled source.' },
     },
     output: { schema: CRAWL_OUTPUT_SCHEMA, render: renderJson },
-    timeoutMs: 120000,
+    timeoutMs: timeouts.crawl,
     isConcurrencySafe: () => true,
     async execute(args, exec) {
-      const json = await requestWithFailover('crawl', buildNavBody(normalizeNavArgs(args, { crawl: true })), 120000, exec)
+      const json = await requestWithFailover('crawl', buildNavBody(normalizeNavArgs(args, { crawl: true })), timeouts.crawl, exec)
       return projectCrawl(json)
     },
   }))
