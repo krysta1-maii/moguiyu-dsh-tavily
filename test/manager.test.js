@@ -15,7 +15,7 @@ import * as clientConnection from '@deepseek-ai/dsh-client-connection'
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-tavily-manager-'))
 after(() => rmSync(process.env.DSH_HOME, { recursive: true, force: true }))
 
-const { MAX_MANAGER_BODY_BYTES, installBackend } = await import('../src/backend.js')
+const { MAX_MANAGER_BODY_BYTES, USAGE_TTL_MS, installBackend } = await import('../src/backend.js')
 const hostPlugin = await import('../src/index.js')
 const { maskValue } = await import('../src/lib.js')
 const {
@@ -71,10 +71,17 @@ function install(values, options = {}) {
   const credentials = fakeCredentials(values, options.writable !== false)
   const routes = new Map()
   const disposers = []
+  const listeners = new Map()
+  const usageCache = options.usageCache instanceof Map ? options.usageCache : new Map()
   const ctx = {
     logger: { info() {}, warn() {} },
     get(service) {
       return service === 'credentials' ? credentials : undefined
+    },
+    on(event, listener) {
+      if (!listeners.has(event)) listeners.set(event, new Set())
+      listeners.get(event).add(listener)
+      return () => { listeners.get(event)?.delete(listener) }
     },
     effect(callback) {
       const dispose = callback()
@@ -96,10 +103,17 @@ function install(values, options = {}) {
       },
     },
   }
-  installBackend(ctx)
+  installBackend(ctx, { usageCache, now: options.now })
   return {
     credentials,
     routes,
+    usageCache,
+    emit(event, ...args) {
+      for (const listener of listeners.get(event) ?? []) listener(...args)
+    },
+    listenerCount(event) {
+      return listeners.get(event)?.size ?? 0
+    },
     async dispose() {
       while (disposers.length > 0) await disposers.pop()()
     },
@@ -723,4 +737,118 @@ test('a usage request that returns 432 leaves the block in place', async () => {
     },
   )
   assert.notEqual(entryFor(readState(), id).quotaBlock, null)
+})
+
+test('usage cache keys by fingerprint only, reuses within TTL, and evicts expired and removed entries', async () => {
+  const keys = ['tvly-cache-aaaa-00000000', 'tvly-cache-bbbb-11111111']
+  let clock = 1_700_000_000_000
+  const inst = install(keys, { now: () => clock })
+  let fetches = 0
+
+  await withUsageFetch(
+    () => {
+      fetches++
+      return usageResponse({ planUsage: 42, planLimit: 1000 })
+    },
+    async () => {
+      // First call populates cache
+      const first = await callRoute(inst.routes.get('/api/tavily-usage'), 'GET')
+      assert.equal(first.status, 200)
+      assert.equal(fetches, 2)
+      assert.deepEqual([...inst.usageCache.keys()].sort(), keys.map(keyId).sort())
+
+      // Cache keys and values must never contain raw API keys
+      for (const [k, v] of inst.usageCache) {
+        for (const secret of keys) {
+          assert.equal(k.includes(secret), false)
+          assert.equal(JSON.stringify(v).includes(secret), false)
+        }
+      }
+
+      // Second call within TTL hits cache without fetching
+      clock += USAGE_TTL_MS - 1
+      const second = await callRoute(inst.routes.get('/api/tavily-usage'), 'GET')
+      assert.equal(second.status, 200)
+      assert.equal(fetches, 2)
+
+      // Advance past TTL and inject an orphan key id; expired + orphan entries are deleted before refetch
+      inst.usageCache.set('deadbeef00000000', { at: clock, details: { fetchedAt: clock } })
+      clock += 2
+      // Make upstream return 500 so we can observe that expired entries were actually deleted, not merely skipped
+      await withUsageFetch(
+        () => new Response('', { status: 500 }),
+        async () => {
+          const expiredRes = await callRoute(inst.routes.get('/api/tavily-usage'), 'GET')
+          assert.equal(expiredRes.status, 200)
+          assert.equal(inst.usageCache.size, 0, 'expired and orphan cache entries must be deleted')
+        },
+      )
+    },
+  )
+})
+
+test('usage cache is cleared by credential mutations, credentials/reference-updated events, and Host unload', async () => {
+  const keys = ['tvly-evict-aaaa-00000000', 'tvly-evict-bbbb-11111111']
+  let clock = 1_700_000_000_000
+  const instA = install(keys, { now: () => clock })
+  const instB = install(keys, { now: () => clock })
+
+  await withUsageFetch(
+    () => usageResponse({ planUsage: 10, planLimit: 1000 }),
+    async () => {
+      await callRoute(instA.routes.get('/api/tavily-usage'), 'GET')
+      assert.equal(instA.usageCache.size, 2)
+      // Separate Host install owns an independent cache
+      assert.equal(instB.usageCache.size, 0)
+
+      // Removing/replacing a key clears cache
+      await callRoute(instA.routes.get('/api/tavily-manager/update'), 'POST', {
+        add: ['tvly-evict-cccc-22222222'],
+        remove: [maskValue(keys[1])],
+      })
+      assert.equal(instA.usageCache.size, 0)
+
+      // Repopulate cache, then verify credentials/reference-updated
+      await callRoute(instA.routes.get('/api/tavily-usage'), 'GET')
+      assert.equal(instA.usageCache.size, 2)
+      instA.emit('credentials/reference-updated', 'UNRELATED_REF')
+      assert.equal(instA.usageCache.size, 2)
+      instA.emit('credentials/reference-updated', 'TAVILY_API_KEYS')
+      assert.equal(instA.usageCache.size, 0)
+
+      // Repopulate and verify Host unload clears cache and removes event listener
+      await callRoute(instA.routes.get('/api/tavily-usage'), 'GET')
+      assert.equal(instA.usageCache.size, 2)
+      assert.equal(instA.listenerCount('credentials/reference-updated'), 1)
+      await instA.dispose()
+      assert.equal(instA.usageCache.size, 0)
+      assert.equal(instA.listenerCount('credentials/reference-updated'), 0)
+    },
+  )
+})
+
+test('usage cache respects minFetchedAt so a pre-block cached sample forces a fresh fetch', async () => {
+  const keys = ['tvly-minat-aaaa-00000000']
+  const id = keyId(keys[0])
+  let clock = 1_700_000_000_000
+  const inst = install(keys, { now: () => clock })
+  let fetches = 0
+
+  await withUsageFetch(
+    () => {
+      fetches++
+      return usageResponse({ planUsage: fetches === 1 ? 100 : 150, planLimit: 1000 })
+    },
+    async () => {
+      await callRoute(inst.routes.get('/api/tavily-usage'), 'GET')
+      assert.equal(fetches, 1)
+      clock += 1000
+      recordQuotaBlock(id, 'plan', new Date(clock).toISOString())
+      clock += 1000
+      const res = await callRoute(inst.routes.get('/api/tavily-usage'), 'GET')
+      assert.equal(fetches, 2, 'cached sample older than quotaBlock must not be reused')
+      assert.equal(res.body.perKey[0].active, true)
+      assert.equal(res.body.perKey[0].planUsage, 150)
+    },
+  )
 })

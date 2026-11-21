@@ -38,10 +38,9 @@ import {
 } from './state.js'
 
 export const MAX_MANAGER_BODY_BYTES = 64 * 1024
+export const USAGE_TTL_MS = 60000
 
-const USAGE_TTL_MS = 60000
 const USAGE_TIMEOUT_MS = 15000
-const usageCache = new Map()
 
 const LEGACY_STATE = 'tavily-settings.json'
 const REFS = ['TAVILY_API_KEYS', 'TAVILY_API_KEY']
@@ -130,6 +129,14 @@ function metric(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
+function pruneUsageCache(cache, activeIds, currentTime) {
+  for (const [id, entry] of cache) {
+    if (currentTime - entry.at >= USAGE_TTL_MS || (activeIds !== undefined && !activeIds.has(id))) {
+      cache.delete(id)
+    }
+  }
+}
+
 /**
  * Fetch one key's usage. The response separates the key's own counters from
  * the account plan and pay-as-you-go counters; recovery uses the account
@@ -138,12 +145,17 @@ function metric(value) {
  * `minFetchedAt` forces a fresh request when the cached sample predates a
  * quota block; a sample taken before the block must not clear it.
  * `signal` cancels the upstream request when the caller disconnects.
+ * The cache is owned by the Host install and keyed strictly by `keyId(key)`.
  */
-async function fetchUsageDetailsFor(key, { minFetchedAt = 0, signal } = {}) {
-  const cached = usageCache.get(key)
+async function fetchUsageDetailsFor(key, { cache, id = keyId(key), minFetchedAt = 0, signal, now = Date.now } = {}) {
   const minAt = Number.isFinite(minFetchedAt) ? minFetchedAt : 0
-  if (cached !== undefined && Date.now() - cached.at < USAGE_TTL_MS && cached.details.fetchedAt >= minAt) {
-    return cached.details
+  const cached = cache.get(id)
+  if (cached !== undefined) {
+    if (now() - cached.at >= USAGE_TTL_MS) {
+      cache.delete(id)
+    } else if (cached.details.fetchedAt >= minAt) {
+      return cached.details
+    }
   }
   if (signal?.aborted) return null
   const controller = new AbortController()
@@ -169,6 +181,7 @@ async function fetchUsageDetailsFor(key, { minFetchedAt = 0, signal } = {}) {
     const paygoLimit = metric(account?.paygo_limit)
     const currentPlan = account !== undefined && typeof account.current_plan === 'string' ? account.current_plan : null
     if (keyUsage === null && planUsage === null && paygoUsage === null) return null
+    const fetchedAt = now()
     const details = {
       usage: keyUsage !== null ? keyUsage : planUsage,
       keyUsage,
@@ -178,9 +191,9 @@ async function fetchUsageDetailsFor(key, { minFetchedAt = 0, signal } = {}) {
       paygoUsage,
       paygoLimit,
       currentPlan,
-      fetchedAt: Date.now(),
+      fetchedAt,
     }
-    usageCache.set(key, { at: details.fetchedAt, details })
+    cache.set(id, { at: fetchedAt, details })
     return details
   } catch {
     return null
@@ -288,8 +301,20 @@ export function warnIfNoKeys(ctx) {
  * Every route is registered through `ctx.effect`, so the calling fiber owns
  * it and unloading the row disposes every route cleanly.
  */
-export function installBackend(ctx) {
+export function installBackend(ctx, options = {}) {
   const credentials = ctx.get('credentials')
+  const usageCache = options.usageCache instanceof Map ? options.usageCache : new Map()
+  const now = typeof options.now === 'function' ? options.now : Date.now
+
+  ctx.effect(() => () => {
+    usageCache.clear()
+  }, 'tavily-backend: usage cache')
+
+  if (typeof ctx.on === 'function') {
+    ctx.effect(() => ctx.on('credentials/reference-updated', (ref) => {
+      if (ref === 'TAVILY_API_KEYS' || ref === 'TAVILY_API_KEY') usageCache.clear()
+    }), 'tavily-backend: credentials cache invalidation')
+  }
 
   function errorResponse(error) {
     if (error instanceof Error && typeof error.code === 'string' && error.code.startsWith('TAVILY_')) {
@@ -365,6 +390,7 @@ export function installBackend(ctx) {
       if (credentials === undefined) return jsonResponse(500, { ok: false, error: 'credentials service unavailable' })
       try {
         const { values: keys } = await collectStoredKeys(credentials)
+        pruneUsageCache(usageCache, new Set(keys.map(keyId)), now())
         if (keys.length === 0) return jsonResponse(200, { ok: false, error: 'no Tavily API key configured' })
         const initial = readState()
         const fetched = []
@@ -374,8 +400,11 @@ export function installBackend(ctx) {
           const entry = entryFor(initial, id)
           const blockAt = entry.quotaBlock !== null ? Date.parse(entry.quotaBlock.at) : 0
           const details = await fetchUsageDetailsFor(key, {
+            cache: usageCache,
+            id,
             minFetchedAt: Number.isFinite(blockAt) ? blockAt : 0,
             signal: request.signal,
+            now,
           })
           if (details !== null && entry.quotaBlock !== null) {
             const ratio = recoveryRatio(entry.quotaBlock.reason, details)
@@ -524,6 +553,10 @@ export function installBackend(ctx) {
           } else {
             await credentials.set('TAVILY_API_KEYS', values.join(','))
             await syncPrimary(credentials, values[0])
+          }
+
+          if (addValues.length > 0 || removeMasked.length > 0) {
+            usageCache.clear()
           }
 
           // Keep the saved dates, prune availability records for removed keys,
