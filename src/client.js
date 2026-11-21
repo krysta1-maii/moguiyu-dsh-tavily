@@ -11,8 +11,6 @@ export function factory(require) {
   const inject = ['slots']
 
   const ICONS = {
-    eye: ['M1.5 8C1.5 8 4 3.5 8 3.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Z', 'M8 5.8a2.2 2.2 0 1 0 0 4.4 2.2 2.2 0 0 0 0-4.4Z'],
-    eyeOff: ['M1.5 8C1.5 8 4 3.5 8 3.5c1.6 0 3 .5 4.1 1.2', 'M14.5 8C14.5 8 12 12.5 8 12.5c-1.6 0-3-.5-4.1-1.2', 'M2 2l12 12', 'M8 5.8a2.2 2.2 0 0 1 2.2 2.2'],
     pencil: ['M11.2 2.3l2.5 2.5L6 12.5l-3.3.8.8-3.3 7.7-7.7Z', 'M9.5 4l2.5 2.5'],
     trash: ['M2.5 4h11', 'M6.2 4V2.8h3.6V4', 'M4.2 4l.7 9.2h6.2L11.8 4', 'M6.5 6.5v4.2', 'M9.5 6.5v4.2'],
     check: ['M3 8.5l3.5 3.5L13 5'],
@@ -120,7 +118,6 @@ export function factory(require) {
     const [replacing, setReplacing] = react.useState({})
     const [replaceDrafts, setReplaceDrafts] = react.useState({})
     const [adds, setAdds] = react.useState([])
-    const [revealed, setRevealed] = react.useState({})
     const [confirm, setConfirm] = react.useState({})
     const [busy, setBusy] = react.useState(false)
     const [notice, setNotice] = react.useState(null)
@@ -156,7 +153,7 @@ export function factory(require) {
       setBusy(true)
       setNotice(null)
       try {
-        const response = await fetch('/api/tavily-manager', {
+        const response = await fetch('/api/tavily-manager/update', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ mode: next })
@@ -177,7 +174,7 @@ export function factory(require) {
       setBusy(true)
       setNotice(null)
       try {
-        const response = await fetch('/api/tavily-manager', {
+        const response = await fetch('/api/tavily-manager/update', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ setEnabled: [{ id, enabled }] })
@@ -207,7 +204,7 @@ export function factory(require) {
       setBusy(true)
       setNotice(null)
       try {
-        const response = await fetch('/api/tavily-manager', {
+        const response = await fetch('/api/tavily-manager/update', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ order: next })
@@ -229,7 +226,7 @@ export function factory(require) {
       setBusy(true)
       setNotice(null)
       try {
-        const response = await fetch('/api/tavily-manager', {
+        const response = await fetch('/api/tavily-manager/update', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ add: [value], remove: [] })
@@ -250,7 +247,7 @@ export function factory(require) {
       setBusy(true)
       setNotice(null)
       try {
-        const response = await fetch('/api/tavily-manager', {
+        const response = await fetch('/api/tavily-manager/update', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ add: [], remove: [masked] })
@@ -260,7 +257,6 @@ export function factory(require) {
         setNotice({ ok: 'Key removed.' })
         setConfirm((current) => Object.assign({}, current, { [masked]: false }))
         setRemoving((current) => Object.assign({}, current, { [masked]: false }))
-        setRevealed((current) => Object.assign({}, current, { [masked]: false }))
         await refresh()
       } catch (error) {
         setNotice({ error: String(error && error.message ? error.message : error) })
@@ -275,7 +271,7 @@ export function factory(require) {
       setBusy(true)
       setNotice(null)
       try {
-        const response = await fetch('/api/tavily-manager', {
+        const response = await fetch('/api/tavily-manager/update', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ add: [value], remove: [masked] })
@@ -285,27 +281,7 @@ export function factory(require) {
         setNotice({ ok: 'Key updated.' })
         setReplacing((current) => Object.assign({}, current, { [masked]: false }))
         setReplaceDrafts((current) => Object.assign({}, current, { [masked]: '' }))
-        setRevealed((current) => Object.assign({}, current, { [masked]: false }))
         await refresh()
-      } catch (error) {
-        setNotice({ error: String(error && error.message ? error.message : error) })
-      } finally {
-        setBusy(false)
-      }
-    }
-
-    const toggleReveal = async (masked) => {
-      if (typeof revealed[masked] === 'string') {
-        setRevealed((current) => Object.assign({}, current, { [masked]: false }))
-        return
-      }
-      setBusy(true)
-      setNotice(null)
-      try {
-        const response = await fetch('/api/tavily-manager?reveal=' + encodeURIComponent(masked), { cache: 'no-store' })
-        const data = await response.json()
-        if (data.ok) setRevealed((current) => Object.assign({}, current, { [masked]: data.value }))
-        else setNotice({ error: data.error || 'Failed to reveal key' })
       } catch (error) {
         setNotice({ error: String(error && error.message ? error.message : error) })
       } finally {
@@ -320,7 +296,6 @@ export function factory(require) {
       }
       setConfirm((current) => Object.assign({}, current, { [masked]: false }))
       setRemoving((current) => Object.assign({}, current, { [masked]: true }))
-      setRevealed((current) => Object.assign({}, current, { [masked]: false }))
       saveRemove(masked)
     }
 
@@ -404,7 +379,6 @@ export function factory(require) {
                     const keyRef = key.id !== undefined ? key.id : masked
                     const isRemoved = removing[masked] === true
                     const isReplacing = replacing[masked] === true
-                    const isRevealed = typeof revealed[masked] === 'string'
                     const status = keyStatus(key)
                     const usageRow = usage !== null && usage.ok === true
                       ? (usage.perKey.find((row) => key.id !== undefined ? row.id === key.id : row.masked === masked) || null)
@@ -423,7 +397,7 @@ export function factory(require) {
                               disabled: busy
                             })
                           : react.createElement('span', null,
-                              isRevealed ? revealed[masked] : masked,
+                              masked,
                               key.primary === true && key.active !== false && currentMode === 'priority' && !isRemoved && react.createElement('span', {
                                 title: 'Primary — the first active key tried',
                                 style: { display: 'inline-block', width: 8, height: 8, borderRadius: 4, background: 'var(--dsw-alias-state-success-primary)', marginLeft: 8, verticalAlign: 'middle', flex: 'none' }
@@ -472,7 +446,6 @@ export function factory(require) {
                           : react.createElement('span', { style: { display: 'inline-flex', gap: 2 } },
                               !isRemoved && react.createElement(IconButton, { icon: 'up', title: 'Move up', onClick: () => moveKey(masked, -1), disabled: busy || keysReadOnly || index === 0 }),
                               !isRemoved && react.createElement(IconButton, { icon: 'down', title: 'Move down', onClick: () => moveKey(masked, 1), disabled: busy || keysReadOnly || index === server.keys.length - 1 }),
-                              !isRemoved && react.createElement(IconButton, { icon: isRevealed ? 'eyeOff' : 'eye', title: isRevealed ? 'Hide key' : 'Show key', onClick: () => toggleReveal(masked), disabled: busy }),
                               !isRemoved && react.createElement(IconButton, { icon: 'pencil', title: 'Edit', onClick: () => startReplace(masked), disabled: busy }),
                               react.createElement(IconButton, {
                                 icon: isRemoved ? 'restore' : (confirm[masked] === true ? 'check' : 'trash'),

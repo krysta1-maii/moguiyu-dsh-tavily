@@ -2,10 +2,11 @@
  * Tests for the two package entries.
  *
  * The Host entry (`src/index.js`, exported as `.`) owns the management card
- * carrier and the two exact routes; it must register no model tool and no
- * prompt section. The preset entry (`src/tools-entry.js`, exported as
+ * carrier and the Connection Fetch routes; it must register no model tool and
+ * no prompt section. The preset entry (`src/tools-entry.js`, exported as
  * `./tools`) owns the four tools and both prompt sections; it must register no
- * route, read no webServer, and keep its round-robin cursor to itself.
+ * route, read neither connection nor webServer, and keep its round-robin
+ * cursor to itself.
  */
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -37,23 +38,30 @@ function fakeCredentials(keys) {
   }
 }
 
-/** A webServer that behaves like the Host one: a duplicate exact route throws. */
-function fakeWebServer() {
+/** A connection service that behaves like DSH 0.2.2-rc.5: duplicate exact paths throw, disposers are async. */
+function fakeConnection() {
   const routes = new Map()
   return {
     routes,
     service: {
-      register(route) {
-        if (routes.has(route.path)) throw new Error('webserver: duplicate exact route "' + route.path + '"')
-        routes.set(route.path, route.handler)
-        return () => routes.delete(route.path)
+      fetch: {
+        register(route) {
+          if (routes.has(route.path)) {
+            throw new Error('connection: exact Fetch route ' + JSON.stringify(route.path) + ' is already registered')
+          }
+          routes.set(route.path, route)
+          return async () => {
+            await Promise.resolve()
+            routes.delete(route.path)
+          }
+        },
       },
     },
   }
 }
 
-/** A Host-shaped context: credentials, effect tracking, webServer, probes. */
-function hostContext({ keys = KEYS, webServer = fakeWebServer() } = {}) {
+/** A Host-shaped context: credentials, effect tracking, connection, probes. */
+function hostContext({ keys = KEYS, connection = fakeConnection() } = {}) {
   const disposers = []
   const warnings = []
   const toolNames = new Set()
@@ -61,6 +69,7 @@ function hostContext({ keys = KEYS, webServer = fakeWebServer() } = {}) {
   const ctx = {
     logger: { info() {}, warn: (...args) => { warnings.push(args) } },
     get(name) {
+      if (name === 'webServer') throw new Error('the Host entry must not read webServer')
       if (name === 'credentials') return fakeCredentials(keys)
       if (name === 'tools') {
         return { register(definition) { toolNames.add(definition.name); return () => toolNames.delete(definition.name) } }
@@ -75,38 +84,53 @@ function hostContext({ keys = KEYS, webServer = fakeWebServer() } = {}) {
       disposers.push(disposer)
       return disposer
     },
-    webServer: webServer.service,
+    connection: connection.service,
   }
-  return { ctx, disposers, warnings, toolNames, sections, routes: webServer.routes }
+  return { ctx, disposers, warnings, toolNames, sections, routes: connection.routes }
 }
 
-function unload(disposers) {
-  while (disposers.length > 0) disposers.pop()()
+async function unload(disposers) {
+  while (disposers.length > 0) await disposers.pop()()
 }
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 
-test('the Host entry registers exactly the two management routes', () => {
+test('the Host entry registers the Connection Fetch management routes', () => {
   const { ctx, routes, toolNames, sections } = hostContext()
   host.apply(ctx)
-  assert.deepEqual([...routes.keys()].sort(), ['/api/tavily-manager', '/api/tavily-usage'])
+  assert.deepEqual(
+    [...routes.keys()].sort(),
+    ['/api/tavily-manager', '/api/tavily-manager/update', '/api/tavily-usage'],
+  )
+  assert.deepEqual(routes.get('/api/tavily-manager').methods, ['GET'])
+  assert.equal(routes.get('/api/tavily-manager').requestBody, 'buffered')
+  assert.deepEqual(routes.get('/api/tavily-manager/update').methods, ['POST'])
+  assert.equal(routes.get('/api/tavily-manager/update').requestBody, 'streaming')
+  assert.deepEqual(routes.get('/api/tavily-usage').methods, ['GET'])
+  assert.equal(routes.get('/api/tavily-usage').requestBody, 'buffered')
   assert.equal(toolNames.size, 0)
   assert.equal(sections.size, 0)
-  assert.deepEqual(host.inject, ['webServer', 'credentials'])
+  assert.deepEqual(host.inject, ['connection', 'credentials'])
 })
 
-test('unloading the Host entry removes both routes', () => {
-  const { ctx, routes, disposers } = hostContext()
-  host.apply(ctx)
-  assert.equal(routes.size, 2)
-  unload(disposers)
-  assert.equal(routes.size, 0)
+test('unloading the Host entry awaits async disposers, removes all routes, and allows remount', async () => {
+  const connection = fakeConnection()
+  const first = hostContext({ connection })
+  host.apply(first.ctx)
+  assert.equal(connection.routes.size, 3)
+  await unload(first.disposers)
+  assert.equal(connection.routes.size, 0)
+  const second = hostContext({ connection })
+  host.apply(second.ctx)
+  assert.equal(connection.routes.size, 3)
+  await unload(second.disposers)
+  assert.equal(connection.routes.size, 0)
 })
 
-test('a second Host mount fails on the duplicate exact route', () => {
-  const server = fakeWebServer()
-  host.apply(hostContext({ webServer: server }).ctx)
-  assert.throws(() => host.apply(hostContext({ webServer: server }).ctx), /duplicate exact route/)
+test('a second Host mount fails on the duplicate exact Fetch route', () => {
+  const connection = fakeConnection()
+  host.apply(hostContext({ connection }).ctx)
+  assert.throws(() => host.apply(hostContext({ connection }).ctx), /already registered/)
 })
 
 test('a missing key warns once per Host mount', async () => {
@@ -143,6 +167,7 @@ function presetContext({ keys = KEYS } = {}) {
     tools: registry,
     get(name) {
       if (name === 'webServer') throw new Error('the preset entry must not read webServer')
+      if (name === 'connection') throw new Error('the preset entry must not read connection')
       if (name === 'credentials') return fakeCredentials(keys)
       if (name === 'tools') return registry
       if (name === 'systemPrompt') {
@@ -167,11 +192,11 @@ test('the preset entry registers the four tools and both prompt sections', () =>
   assert.deepEqual(preset.inject, ['tools', 'credentials', 'systemPrompt'])
 })
 
-test('unloading the preset entry removes every tool and section, and it can be remounted', () => {
+test('unloading the preset entry removes every tool and section, and it can be remounted', async () => {
   const { ctx, tools, sections, disposers } = presetContext()
   preset.apply(ctx)
   assert.equal(tools.size, 4)
-  unload(disposers)
+  await unload(disposers)
   assert.equal(tools.size, 0)
   assert.equal(sections.size, 0)
   preset.apply(ctx)
@@ -245,6 +270,7 @@ test('the preset entry never loads the backend module', () => {
   const source = readFileSync(new URL('../src/tools-entry.js', import.meta.url), 'utf8')
   assert.equal(source.includes('backend'), false)
   assert.equal(source.includes('webServer'), false)
+  assert.equal(source.includes('connection'), false)
 })
 
 test('the bundle patch still inserts exactly one Host row', () => {

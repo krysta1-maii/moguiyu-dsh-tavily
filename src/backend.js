@@ -1,9 +1,9 @@
 /**
  * Routes half of `@moguiyu/dsh-tavily`: key, availability, and usage
- * management on the harness webServer (`/api/tavily-usage`,
- * `/api/tavily-manager`). The built-in `web_search` tool is never replaced —
- * no web search provider is registered and `web.searchProvider` is never
- * touched.
+ * management on DSH Connection Fetch routes (`/api/tavily-usage`,
+ * `/api/tavily-manager`, `/api/tavily-manager/update`). The built-in
+ * `web_search` tool is never replaced — no web search provider is registered
+ * and `web.searchProvider` is never touched.
  *
  * The manager owns three pieces of state now: the credential list, the call
  * mode (priority or round-robin), and a per-key availability record. The
@@ -12,11 +12,13 @@
  * without losing its position.
  *
  * Only the package root entry imports this module. The preset tools entry
- * (`./tools`) never loads it, so no preset can register a second copy of
- * either route, and `/api/tavily-manager` plus `/api/tavily-usage` exist
- * exactly once per Host.
+ * (`./tools`) never loads it, so no preset can register a second copy of any
+ * route, and the management routes exist exactly once per Host.
+ *
+ * All routes run behind `ctx.connection.fetch`, which enforces Host/Origin
+ * trust, authentication, and owner-only access before our handlers execute.
+ * Full API keys are never returned by any route.
  */
-import { isIP } from 'node:net'
 import { join } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { maskValue, parseKeyList, readJsonFile, reorderByMask } from './lib.js'
@@ -35,7 +37,10 @@ import {
   writeState,
 } from './state.js'
 
+export const MAX_MANAGER_BODY_BYTES = 64 * 1024
+
 const USAGE_TTL_MS = 60000
+const USAGE_TIMEOUT_MS = 15000
 const usageCache = new Map()
 
 const LEGACY_STATE = 'tavily-settings.json'
@@ -45,50 +50,80 @@ const MODES = new Set([MODE_PRIORITY, MODE_ROUND_ROBIN])
 const READONLY_LIST = 'TAVILY_API_KEYS is supplied read-only by the launching environment, so the key list cannot be changed here. Unset it in the shell you start dsh from, or manage keys in ~/.dsh/.credentials.yaml.'
 const READONLY_PRIMARY = 'That key comes from TAVILY_API_KEY, which the launching environment supplies read-only. Unset it in the shell you start dsh from.'
 
-/** Environment flag that opts into remote management on a trusted network. */
-const ALLOW_REMOTE_ENV = 'TAVILY_MANAGER_ALLOW_REMOTE'
-
-const REMOTE_DENIED = 'The Tavily management routes accept loopback requests only. Set TAVILY_MANAGER_ALLOW_REMOTE=1 in the environment that launches dsh to allow remote management.'
-
-/**
- * Whether a socket address is this machine's loopback. IPv4-mapped IPv6
- * addresses (`::ffff:127.0.0.1`) are normalized before the test.
- */
-export function isLoopbackAddress(address) {
-  if (typeof address !== 'string') return false
-  const value = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address
-  return value === '::1' || (isIP(value) === 4 && value.startsWith('127.'))
-}
-
-/**
- * Whether this request may use the key-management routes. The launching
- * environment may opt in to remote management for a trusted network.
- */
-export function mayManage(req) {
-  if (process.env[ALLOW_REMOTE_ENV] === '1') return true
-  const socket = req !== null && typeof req === 'object' ? req.socket : undefined
-  const address = socket !== null && typeof socket === 'object' ? socket.remoteAddress : undefined
-  return isLoopbackAddress(address)
-}
-
 function legacyStatePath() {
   return join(resolveDshHome(), LEGACY_STATE)
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = []
-    req.on('data', (chunk) => chunks.push(chunk))
-    req.on('end', () => {
-      const text = Buffer.concat(chunks).toString('utf8')
-      try {
-        resolve(text.length > 0 ? JSON.parse(text) : {})
-      } catch {
-        reject(new Error('invalid JSON body'))
-      }
-    })
-    req.on('error', reject)
+function jsonResponse(status, payload, extraHeaders = {}) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      ...extraHeaders,
+    },
   })
+}
+
+function methodNotAllowed(allowed) {
+  return jsonResponse(405, { ok: false, error: 'method not allowed' }, { allow: allowed.join(', ') })
+}
+
+/**
+ * Stream a JSON object body up to `maxBytes`. Checks `Content-Length` early
+ * when present, and always counts actual streamed bytes so unknown-length or
+ * misdeclared bodies cannot bypass the cap. Cancels the stream on rejection.
+ */
+async function readJsonBody(request, maxBytes = MAX_MANAGER_BODY_BYTES) {
+  const mediaType = request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+  if (mediaType !== 'application/json') {
+    await request.body?.cancel().catch(() => {})
+    return { ok: false, status: 415, error: 'content-type must be application/json' }
+  }
+  const declared = request.headers.get('content-length')?.trim()
+  if (declared !== undefined && /^\d+$/.test(declared) && Number(declared) > maxBytes) {
+    await request.body?.cancel().catch(() => {})
+    return { ok: false, status: 413, error: 'request body too large' }
+  }
+  if (request.body === null) return { ok: true, value: {} }
+  const reader = request.body.getReader()
+  const chunks = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value !== undefined && value.byteLength > 0) {
+        total += value.byteLength
+        if (total > maxBytes) {
+          await reader.cancel().catch(() => {})
+          return { ok: false, status: 413, error: 'request body too large' }
+        }
+        chunks.push(value)
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  if (total === 0) return { ok: true, value: {} }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  const text = new TextDecoder('utf-8').decode(bytes)
+  if (text.length === 0) return { ok: true, value: {} }
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return { ok: false, status: 400, error: 'invalid JSON body' }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { ok: false, status: 400, error: 'request body must be a JSON object' }
+  }
+  return { ok: true, value: parsed }
 }
 
 function metric(value) {
@@ -102,25 +137,26 @@ function metric(value) {
  *
  * `minFetchedAt` forces a fresh request when the cached sample predates a
  * quota block; a sample taken before the block must not clear it.
+ * `signal` cancels the upstream request when the caller disconnects.
  */
-async function fetchUsageDetailsFor(key, { minFetchedAt = 0 } = {}) {
+async function fetchUsageDetailsFor(key, { minFetchedAt = 0, signal } = {}) {
   const cached = usageCache.get(key)
   const minAt = Number.isFinite(minFetchedAt) ? minFetchedAt : 0
   if (cached !== undefined && Date.now() - cached.at < USAGE_TTL_MS && cached.details.fetchedAt >= minAt) {
     return cached.details
   }
+  if (signal?.aborted) return null
+  const controller = new AbortController()
+  const onAbort = () => controller.abort(signal.reason)
+  if (signal !== undefined && signal !== null) {
+    signal.addEventListener('abort', onAbort, { once: true })
+  }
+  const timer = setTimeout(() => controller.abort(), USAGE_TIMEOUT_MS)
   try {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 15000)
-    let response
-    try {
-      response = await fetch('https://api.tavily.com/usage', {
-        headers: { authorization: 'Bearer ' + key, accept: 'application/json' },
-        signal: controller.signal,
-      })
-    } finally {
-      clearTimeout(timer)
-    }
+    const response = await fetch('https://api.tavily.com/usage', {
+      headers: { authorization: 'Bearer ' + key, accept: 'application/json' },
+      signal: controller.signal,
+    })
     if (!response.ok) return null
     const json = await response.json()
     const account = json !== null && typeof json === 'object' ? json.account : undefined
@@ -148,6 +184,9 @@ async function fetchUsageDetailsFor(key, { minFetchedAt = 0 } = {}) {
     return details
   } catch {
     return null
+  } finally {
+    clearTimeout(timer)
+    if (signal !== undefined && signal !== null) signal.removeEventListener('abort', onAbort)
   }
 }
 
@@ -242,18 +281,22 @@ export function warnIfNoKeys(ctx) {
 }
 
 /**
- * Register the Tavily key/usage routes on `ctx.webServer`:
- * `/api/tavily-usage` and `/api/tavily-manager`.
+ * Register the Tavily key/usage routes on `ctx.connection.fetch`:
+ * `GET /api/tavily-usage`, `GET /api/tavily-manager`, and
+ * `POST /api/tavily-manager/update`.
  *
  * Every route is registered through `ctx.effect`, so the calling fiber owns
- * it and unloading the row leaves nothing registered.
+ * it and unloading the row disposes every route cleanly.
  */
 export function installBackend(ctx) {
   const credentials = ctx.get('credentials')
 
-  const send = (res, status, payload) => {
-    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-    res.end(JSON.stringify(payload))
+  function errorResponse(error) {
+    if (error instanceof Error && typeof error.code === 'string' && error.code.startsWith('TAVILY_')) {
+      return jsonResponse(500, { ok: false, code: error.code, error: error.message })
+    }
+    ctx.logger.warn('tavily-backend: request failed: %s', error instanceof Error ? error.message : String(error))
+    return jsonResponse(500, { ok: false, error: 'internal server error' })
   }
 
   // ── key manager payload ────────────────────────────────────────────────────
@@ -313,22 +356,27 @@ export function installBackend(ctx) {
    * refresh is the only trigger, and it must leave the tool layer with the
    * recovered state.
    */
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
+  ctx.effect(() => ctx.connection.fetch.register({
     path: '/api/tavily-usage',
-    handler: async (req, res) => {
-      if (!mayManage(req)) return send(res, 403, { ok: false, error: REMOTE_DENIED })
-      if (credentials === undefined) return send(res, 500, { ok: false, error: 'credentials service unavailable' })
+    methods: ['GET'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      if (request.method !== 'GET') return methodNotAllowed(['GET'])
+      if (credentials === undefined) return jsonResponse(500, { ok: false, error: 'credentials service unavailable' })
       try {
         const { values: keys } = await collectStoredKeys(credentials)
-        if (keys.length === 0) return send(res, 200, { ok: false, error: 'no Tavily API key configured' })
+        if (keys.length === 0) return jsonResponse(200, { ok: false, error: 'no Tavily API key configured' })
         const initial = readState()
         const fetched = []
         for (const key of keys) {
+          if (request.signal?.aborted) break
           const id = keyId(key)
           const entry = entryFor(initial, id)
           const blockAt = entry.quotaBlock !== null ? Date.parse(entry.quotaBlock.at) : 0
-          const details = await fetchUsageDetailsFor(key, { minFetchedAt: Number.isFinite(blockAt) ? blockAt : 0 })
+          const details = await fetchUsageDetailsFor(key, {
+            minFetchedAt: Number.isFinite(blockAt) ? blockAt : 0,
+            signal: request.signal,
+          })
           if (details !== null && entry.quotaBlock !== null) {
             const ratio = recoveryRatio(entry.quotaBlock.reason, details)
             if (ratio !== null && ratio < RECOVERY_THRESHOLD) {
@@ -354,7 +402,7 @@ export function installBackend(ctx) {
             : { ok: true, ...base, ...details }
         })
         const okRows = perKey.filter((row) => row.ok)
-        return send(res, 200, {
+        return jsonResponse(200, {
           ok: true,
           perKey,
           totals: {
@@ -366,130 +414,142 @@ export function installBackend(ctx) {
           },
         })
       } catch (error) {
-        send(res, 500, { ok: false, error: String(error && error.message ? error.message : error) })
+        return errorResponse(error)
       }
     },
   }), 'tavily-backend: route /api/tavily-usage')
 
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
+  ctx.effect(() => ctx.connection.fetch.register({
     path: '/api/tavily-manager',
-    handler: async (req, res) => {
-      if (!mayManage(req)) return send(res, 403, { ok: false, error: REMOTE_DENIED })
-      if (credentials === undefined) return send(res, 500, { ok: false, error: 'credentials service unavailable' })
+    methods: ['GET'],
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      if (request.method !== 'GET') return methodNotAllowed(['GET'])
+      if (credentials === undefined) return jsonResponse(500, { ok: false, error: 'credentials service unavailable' })
       try {
-        const url = new URL(req.url || '/', 'http://x')
-        if (req.method === 'GET') {
-          const reveal = url.searchParams.get('reveal')
-          const { values: keys, source } = await collectStoredKeys(credentials)
-          if (reveal !== null) {
-            const match = keys.find((key) => maskValue(key) === reveal)
-            if (match === undefined) return send(res, 404, { ok: false, error: 'key not found' })
-            return send(res, 200, { ok: true, value: match })
-          }
-          return send(res, 200, { ok: true, ...(await buildManagerPayload(keys, source)) })
-        }
-        if (req.method === 'POST') {
-          const body = await readBody(req)
-          const addValues = Array.isArray(body.add)
-            ? body.add.map((item) => typeof item === 'string' ? item.trim() : '').filter((value) => value.length > 0)
-            : []
-          const removeMasked = Array.isArray(body.remove)
-            ? body.remove.filter((item) => typeof item === 'string' && item.length > 0)
-            : []
-          const orderMasked = Array.isArray(body.order)
-            ? body.order.filter((item) => typeof item === 'string' && item.length > 0)
-            : []
-          const modeValue = body.mode === undefined ? null : body.mode
-          if (modeValue !== null && (typeof modeValue !== 'string' || !MODES.has(modeValue))) {
-            return send(res, 400, { ok: false, error: 'mode must be priority or round_robin' })
-          }
-          if (body.setEnabled !== undefined && !Array.isArray(body.setEnabled)) {
-            return send(res, 400, { ok: false, error: 'setEnabled must be an array of { id, enabled }' })
-          }
-          const toggles = []
-          for (const item of Array.isArray(body.setEnabled) ? body.setEnabled : []) {
-            if (item === null || typeof item !== 'object' || typeof item.id !== 'string' || item.id.length === 0 || typeof item.enabled !== 'boolean') {
-              return send(res, 400, { ok: false, error: 'setEnabled must be an array of { id, enabled }' })
-            }
-            toggles.push({ id: item.id, enabled: item.enabled })
-          }
-
-          const keysChanged = addValues.length > 0 || removeMasked.length > 0 || orderMasked.length > 0
-          let { values: stored, source } = await collectStoredKeys(credentials)
-          if (orderMasked.length > 0) {
-            const reordered = reorderByMask(stored, orderMasked)
-            if (reordered === null) {
-              return send(res, 409, { ok: false, error: 'order must list every current key exactly once, by its masked value' })
-            }
-            stored = reordered
-          }
-          if (removeMasked.length > 0) {
-            stored = stored.filter((key) => !removeMasked.includes(maskValue(key)))
-          }
-          const values = [...stored]
-          for (const value of addValues) {
-            if (!values.includes(value)) values.push(value)
-          }
-          const knownIds = new Set(values.map(keyId))
-          for (const toggle of toggles) {
-            if (!knownIds.has(toggle.id)) {
-              return send(res, 409, { ok: false, error: 'setEnabled references a key that is not in the list' })
-            }
-          }
-
-          // A ref the launching environment supplies is inherited READ-ONLY: set and
-          // unset throw for it. Decide that BEFORE writing anything. Mode and
-          // availability changes only touch the routing state, so they stay
-          // available even when the list itself is read-only.
-          if (keysChanged) {
-            const canWriteList = await refWritable(credentials, 'TAVILY_API_KEYS')
-            const canWritePrimary = await refWritable(credentials, 'TAVILY_API_KEY')
-            if (!canWriteList) return send(res, 409, { ok: false, error: READONLY_LIST })
-            if (!canWritePrimary && source === 'primary' && removeMasked.length > 0) {
-              return send(res, 409, { ok: false, error: READONLY_PRIMARY })
-            }
-            // Emptying the list while an inherited primary still carries a key would
-            // read straight back as that key, so refuse rather than appear to undo itself.
-            if (values.length === 0 && !canWritePrimary) {
-              const inherited = parseKeyList(await resolveRef(credentials, 'TAVILY_API_KEY') ?? '')
-              if (inherited.length > 0) return send(res, 409, { ok: false, error: READONLY_PRIMARY })
-            }
-
-            if (values.length === 0) {
-              await credentials.unset('TAVILY_API_KEYS')
-              await syncPrimary(credentials, null)
-            } else {
-              await credentials.set('TAVILY_API_KEYS', values.join(','))
-              await syncPrimary(credentials, values[0])
-            }
-
-            // Keep the saved dates, prune availability records for removed keys,
-            // and preserve mode/availability while replacing keySavedAt.
-            const state = readState()
-            const kept = new Set(values.map(keyId))
-            for (const id of Object.keys(state.keys)) {
-              if (!kept.has(id)) delete state.keys[id]
-            }
-            const now = new Date().toISOString()
-            const nextSavedAt = {}
-            for (const value of values) {
-              const masked = maskValue(value)
-              nextSavedAt[masked] = state.keySavedAt[masked] !== undefined ? state.keySavedAt[masked] : now
-            }
-            state.keySavedAt = nextSavedAt
-            writeState(state)
-          }
-
-          if (modeValue !== null) setMode(modeValue)
-          for (const toggle of toggles) setEnabled(toggle.id, toggle.enabled)
-
-          return send(res, 200, { ok: true, ...(await buildManagerPayload(values, source)) })
-        }
-        return send(res, 405, { ok: false, error: 'method not allowed' })
+        const { values: keys, source } = await collectStoredKeys(credentials)
+        return jsonResponse(200, { ok: true, ...(await buildManagerPayload(keys, source)) })
       } catch (error) {
-        send(res, 500, { ok: false, error: String(error && error.message ? error.message : error) })
+        return errorResponse(error)
       }
     },
   }), 'tavily-backend: route /api/tavily-manager')
+
+  ctx.effect(() => ctx.connection.fetch.register({
+    path: '/api/tavily-manager/update',
+    methods: ['POST'],
+    requestBody: 'streaming',
+    fetch: async (request) => {
+      if (request.method !== 'POST') {
+        await request.body?.cancel().catch(() => {})
+        return methodNotAllowed(['POST'])
+      }
+      if (credentials === undefined) {
+        await request.body?.cancel().catch(() => {})
+        return jsonResponse(500, { ok: false, error: 'credentials service unavailable' })
+      }
+      try {
+        const parsed = await readJsonBody(request, MAX_MANAGER_BODY_BYTES)
+        if (!parsed.ok) return jsonResponse(parsed.status, { ok: false, error: parsed.error })
+        const body = parsed.value
+
+        const addValues = Array.isArray(body.add)
+          ? body.add.map((item) => typeof item === 'string' ? item.trim() : '').filter((value) => value.length > 0)
+          : []
+        const removeMasked = Array.isArray(body.remove)
+          ? body.remove.filter((item) => typeof item === 'string' && item.length > 0)
+          : []
+        const orderMasked = Array.isArray(body.order)
+          ? body.order.filter((item) => typeof item === 'string' && item.length > 0)
+          : []
+        const modeValue = body.mode === undefined ? null : body.mode
+        if (modeValue !== null && (typeof modeValue !== 'string' || !MODES.has(modeValue))) {
+          return jsonResponse(400, { ok: false, error: 'mode must be priority or round_robin' })
+        }
+        if (body.setEnabled !== undefined && !Array.isArray(body.setEnabled)) {
+          return jsonResponse(400, { ok: false, error: 'setEnabled must be an array of { id, enabled }' })
+        }
+        const toggles = []
+        for (const item of Array.isArray(body.setEnabled) ? body.setEnabled : []) {
+          if (item === null || typeof item !== 'object' || typeof item.id !== 'string' || item.id.length === 0 || typeof item.enabled !== 'boolean') {
+            return jsonResponse(400, { ok: false, error: 'setEnabled must be an array of { id, enabled }' })
+          }
+          toggles.push({ id: item.id, enabled: item.enabled })
+        }
+
+        const keysChanged = addValues.length > 0 || removeMasked.length > 0 || orderMasked.length > 0
+        let { values: stored, source } = await collectStoredKeys(credentials)
+        if (orderMasked.length > 0) {
+          const reordered = reorderByMask(stored, orderMasked)
+          if (reordered === null) {
+            return jsonResponse(409, { ok: false, error: 'order must list every current key exactly once, by its masked value' })
+          }
+          stored = reordered
+        }
+        if (removeMasked.length > 0) {
+          stored = stored.filter((key) => !removeMasked.includes(maskValue(key)))
+        }
+        const values = [...stored]
+        for (const value of addValues) {
+          if (!values.includes(value)) values.push(value)
+        }
+        const knownIds = new Set(values.map(keyId))
+        for (const toggle of toggles) {
+          if (!knownIds.has(toggle.id)) {
+            return jsonResponse(409, { ok: false, error: 'setEnabled references a key that is not in the list' })
+          }
+        }
+
+        // A ref the launching environment supplies is inherited READ-ONLY: set and
+        // unset throw for it. Decide that BEFORE writing anything. Mode and
+        // availability changes only touch the routing state, so they stay
+        // available even when the list itself is read-only.
+        if (keysChanged) {
+          const canWriteList = await refWritable(credentials, 'TAVILY_API_KEYS')
+          const canWritePrimary = await refWritable(credentials, 'TAVILY_API_KEY')
+          if (!canWriteList) return jsonResponse(409, { ok: false, error: READONLY_LIST })
+          if (!canWritePrimary && source === 'primary' && removeMasked.length > 0) {
+            return jsonResponse(409, { ok: false, error: READONLY_PRIMARY })
+          }
+          // Emptying the list while an inherited primary still carries a key would
+          // read straight back as that key, so refuse rather than appear to undo itself.
+          if (values.length === 0 && !canWritePrimary) {
+            const inherited = parseKeyList(await resolveRef(credentials, 'TAVILY_API_KEY') ?? '')
+            if (inherited.length > 0) return jsonResponse(409, { ok: false, error: READONLY_PRIMARY })
+          }
+
+          if (values.length === 0) {
+            await credentials.unset('TAVILY_API_KEYS')
+            await syncPrimary(credentials, null)
+          } else {
+            await credentials.set('TAVILY_API_KEYS', values.join(','))
+            await syncPrimary(credentials, values[0])
+          }
+
+          // Keep the saved dates, prune availability records for removed keys,
+          // and preserve mode/availability while replacing keySavedAt.
+          const state = readState()
+          const kept = new Set(values.map(keyId))
+          for (const id of Object.keys(state.keys)) {
+            if (!kept.has(id)) delete state.keys[id]
+          }
+          const now = new Date().toISOString()
+          const nextSavedAt = {}
+          for (const value of values) {
+            const masked = maskValue(value)
+            nextSavedAt[masked] = state.keySavedAt[masked] !== undefined ? state.keySavedAt[masked] : now
+          }
+          state.keySavedAt = nextSavedAt
+          writeState(state)
+        }
+
+        if (modeValue !== null) setMode(modeValue)
+        for (const toggle of toggles) setEnabled(toggle.id, toggle.enabled)
+
+        return jsonResponse(200, { ok: true, ...(await buildManagerPayload(values, source)) })
+      } catch (error) {
+        return errorResponse(error)
+      }
+    },
+  }), 'tavily-backend: route /api/tavily-manager/update')
 }
