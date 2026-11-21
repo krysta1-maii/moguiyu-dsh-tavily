@@ -529,6 +529,10 @@ export function installBackend(ctx, options = {}) {
           }
         }
 
+        // Preflight state readability BEFORE any credential write so a corrupt
+        // or unreadable state file never causes partial credential mutations.
+        const preflightState = readState()
+
         // A ref the launching environment supplies is inherited READ-ONLY: set and
         // unset throw for it. Decide that BEFORE writing anything. Mode and
         // availability changes only touch the routing state, so they stay
@@ -561,16 +565,16 @@ export function installBackend(ctx, options = {}) {
 
           // Keep the saved dates, prune availability records for removed keys,
           // and preserve mode/availability while replacing keySavedAt.
-          const state = readState()
+          const state = preflightState
           const kept = new Set(values.map(keyId))
           for (const id of Object.keys(state.keys)) {
             if (!kept.has(id)) delete state.keys[id]
           }
-          const now = new Date().toISOString()
+          const nowIso = new Date().toISOString()
           const nextSavedAt = {}
           for (const value of values) {
             const masked = maskValue(value)
-            nextSavedAt[masked] = state.keySavedAt[masked] !== undefined ? state.keySavedAt[masked] : now
+            nextSavedAt[masked] = state.keySavedAt[masked] !== undefined ? state.keySavedAt[masked] : nowIso
           }
           state.keySavedAt = nextSavedAt
           writeState(state)

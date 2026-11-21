@@ -21,11 +21,15 @@
 import { createHash } from 'node:crypto'
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { HarnessError } from '@deepseek-ai/dsh-error'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
-import { readJsonFile } from './lib.js'
+import { readJsonObjectFileStrict } from './lib.js'
 
 export const MODE_PRIORITY = 'priority'
 export const MODE_ROUND_ROBIN = 'round_robin'
+
+export const STATE_INVALID_CODE = 'TAVILY_STATE_INVALID'
+export const STATE_READ_FAILED_CODE = 'TAVILY_STATE_READ_FAILED'
 
 /** Re-enable a quota-blocked key only after this fraction of its limit is used. */
 export const RECOVERY_THRESHOLD = 0.4
@@ -73,8 +77,35 @@ export function normalizeState(value) {
   }
 }
 
-export function readState() {
-  return normalizeState(readJsonFile(statePath(), {}))
+/**
+ * Strictly read the manager state file. Only `ENOENT` yields default initial
+ * state; corrupt JSON, non-object JSON roots, and permission/I/O failures
+ * throw a structured `HarnessError` so callers never silently overwrite a
+ * broken or unreadable state file.
+ */
+export function readState(reader = readJsonObjectFileStrict) {
+  const path = statePath()
+  const result = reader(path)
+  if (result.kind === 'missing') return normalizeState({})
+  if (result.kind === 'ok') return normalizeState(result.value)
+  if (result.kind === 'read_error') {
+    throw new HarnessError(
+      `Failed to read Tavily state file ${path} (${result.fsCode})`,
+      STATE_READ_FAILED_CODE,
+      { cause: result.cause },
+    )
+  }
+  if (result.kind === 'invalid_json') {
+    throw new HarnessError(
+      `Invalid JSON in Tavily state file ${path} (JSON_PARSE_ERROR)`,
+      STATE_INVALID_CODE,
+      { cause: result.cause },
+    )
+  }
+  throw new HarnessError(
+    `Invalid root value in Tavily state file ${path} (EXPECTED_OBJECT)`,
+    STATE_INVALID_CODE,
+  )
 }
 
 export function writeState(state) {

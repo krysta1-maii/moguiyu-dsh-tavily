@@ -4,7 +4,7 @@
  * availability, usage-driven quota recovery, and usage request cancellation.
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -19,11 +19,13 @@ const { MAX_MANAGER_BODY_BYTES, USAGE_TTL_MS, installBackend } = await import('.
 const hostPlugin = await import('../src/index.js')
 const { maskValue } = await import('../src/lib.js')
 const {
+  STATE_INVALID_CODE,
   entryFor,
   keyId,
   readState,
   recordQuotaBlock,
   setEnabled,
+  setMode,
   statePath,
 } = await import('../src/state.js')
 
@@ -851,4 +853,45 @@ test('usage cache respects minFetchedAt so a pre-block cached sample forces a fr
       assert.equal(res.body.perKey[0].planUsage, 150)
     },
   )
+})
+
+test('corrupt state file fails manager GET, usage GET, and manager POST before any credential or state write', async () => {
+  const corrupt = '{corrupt-state-content-do-not-leak'
+  writeFileSync(statePath(), corrupt, 'utf8')
+  const { routes, credentials } = install(KEYS)
+
+  const getRes = await callRoute(routes.get('/api/tavily-manager'), 'GET')
+  assert.equal(getRes.status, 500)
+  assert.equal(getRes.body.code, STATE_INVALID_CODE)
+  assert.equal(getRes.text.includes('corrupt-state-content-do-not-leak'), false)
+
+  const usageRes = await callRoute(routes.get('/api/tavily-usage'), 'GET')
+  assert.equal(usageRes.status, 500)
+  assert.equal(usageRes.body.code, STATE_INVALID_CODE)
+
+  const postRes = await callRoute(routes.get('/api/tavily-manager/update'), 'POST', {
+    add: ['tvly-should-never-write-000000'],
+    mode: 'round_robin',
+  })
+  assert.equal(postRes.status, 500)
+  assert.equal(postRes.body.code, STATE_INVALID_CODE)
+  assert.equal(credentials.calls.set, 0, 'state preflight failure must block credentials.set')
+  assert.equal(credentials.calls.unset, 0, 'state preflight failure must block credentials.unset')
+  assert.equal(credentials.store.get('TAVILY_API_KEYS'), KEYS.join(','))
+  assert.equal(readFileSync(statePath(), 'utf8'), corrupt, 'corrupt state bytes must remain untouched')
+})
+
+test('corrupt legacy tavily-settings.json does not fail or reset current manager state', async () => {
+  setMode('round_robin')
+  const legacyPath = join(process.env.DSH_HOME, 'tavily-settings.json')
+  writeFileSync(legacyPath, '{broken legacy file', 'utf8')
+  try {
+    const { routes } = install(KEYS)
+    const res = await callRoute(routes.get('/api/tavily-manager'), 'GET')
+    assert.equal(res.status, 200)
+    assert.equal(res.body.mode, 'round_robin')
+    assert.equal(readState().mode, 'round_robin')
+  } finally {
+    rmSync(legacyPath, { force: true })
+  }
 })

@@ -59,7 +59,7 @@ export function reorderByMask(keys, order) {
   return out
 }
 
-/** Read a JSON object file; `fallback` on missing or unparsable content. */
+/** Read a JSON object file; `fallback` on missing or unparsable content (best-effort, for legacy files only). */
 export function readJsonFile(path, fallback) {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'))
@@ -67,4 +67,35 @@ export function readJsonFile(path, fallback) {
   } catch {
     return fallback
   }
+}
+
+/**
+ * Strictly read a JSON object file.
+ * Only `ENOENT` returns `{ kind: 'missing' }`. Permission/I/O failures,
+ * invalid JSON, and non-object JSON roots return structured errors without
+ * exposing file contents.
+ */
+export function readJsonObjectFileStrict(path) {
+  let text
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (error) {
+    if (error !== null && typeof error === 'object' && error.code === 'ENOENT') {
+      return { kind: 'missing' }
+    }
+    const fsCode = error !== null && typeof error === 'object' && typeof error.code === 'string'
+      ? error.code
+      : 'IO_ERROR'
+    return { kind: 'read_error', fsCode, cause: error }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    return { kind: 'invalid_json', cause: error }
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { kind: 'invalid_root' }
+  }
+  return { kind: 'ok', value: parsed }
 }

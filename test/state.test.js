@@ -4,10 +4,11 @@
  * tools installation.
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, beforeEach, test } from 'node:test'
+import { HarnessError } from '@deepseek-ai/dsh-error'
 
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-tavily-state-'))
 after(() => rmSync(process.env.DSH_HOME, { recursive: true, force: true }))
@@ -15,6 +16,8 @@ after(() => rmSync(process.env.DSH_HOME, { recursive: true, force: true }))
 const stateModule = await import('../src/state.js')
 const {
   RECOVERY_THRESHOLD,
+  STATE_INVALID_CODE,
+  STATE_READ_FAILED_CODE,
   entryFor,
   isActive,
   keyId,
@@ -34,7 +37,7 @@ const OTHER = 'tvly-bbbbbbbbbbbbbbbbbbbb'
 const ID = keyId(KEY)
 
 beforeEach(() => {
-  rmSync(statePath(), { force: true })
+  rmSync(statePath(), { recursive: true, force: true })
 })
 
 test('an absent record is enabled and unblocked', () => {
@@ -117,11 +120,91 @@ test('the state file contains no secret and survives a reread', () => {
   assert.equal(readState().keys[ID].quotaBlock.reason, 'paygo')
 })
 
-test('a corrupt state file falls back to defaults', () => {
-  writeFileSync(statePath(), '{not json', 'utf8')
-  const state = readState()
-  assert.equal(state.mode, 'priority')
-  assert.deepEqual(state.keys, {})
+// WP4 replaces the old "corrupt state falls back to defaults" behavior:
+// silent fallback caused subsequent writes to overwrite a damaged state file.
+test('a corrupt state file fails with TAVILY_STATE_INVALID and is never overwritten by mutations', () => {
+  const corrupt = '{not json secret-marker-xyz'
+  writeFileSync(statePath(), corrupt, 'utf8')
+
+  const checkInvalid = (fn) => {
+    assert.throws(fn, (error) => {
+      assert.equal(error instanceof HarnessError, true)
+      assert.equal(error.code, STATE_INVALID_CODE)
+      assert.equal(error.message.includes(statePath()), true)
+      assert.equal(error.message.includes('JSON_PARSE_ERROR'), true)
+      assert.equal(error.message.includes('secret-marker-xyz'), false)
+      return true
+    })
+  }
+
+  checkInvalid(() => readState())
+  checkInvalid(() => setMode('round_robin'))
+  checkInvalid(() => setEnabled(ID, false))
+  checkInvalid(() => recordQuotaBlock(ID, 'plan'))
+  checkInvalid(() => clearQuotaBlock(ID, 'plan'))
+  checkInvalid(() => pruneKeys([KEY]))
+
+  assert.equal(readFileSync(statePath(), 'utf8'), corrupt)
+})
+
+test('a non-object JSON root fails with TAVILY_STATE_INVALID without overwriting the file', () => {
+  for (const raw of ['[]', 'null', '"hello"', '42', 'true']) {
+    writeFileSync(statePath(), raw, 'utf8')
+    assert.throws(() => readState(), (error) => {
+      assert.equal(error instanceof HarnessError, true)
+      assert.equal(error.code, STATE_INVALID_CODE)
+      assert.equal(error.message.includes(statePath()), true)
+      assert.equal(error.message.includes('EXPECTED_OBJECT'), true)
+      return true
+    })
+    assert.throws(() => setMode('round_robin'), (error) => error.code === STATE_INVALID_CODE)
+    assert.equal(readFileSync(statePath(), 'utf8'), raw)
+  }
+})
+
+test('permission and I/O read failures throw TAVILY_STATE_READ_FAILED without modifying disk state', () => {
+  // 1. Directory at state path triggers EISDIR
+  mkdirSync(statePath())
+  assert.throws(() => readState(), (error) => {
+    assert.equal(error instanceof HarnessError, true)
+    assert.equal(error.code, STATE_READ_FAILED_CODE)
+    assert.equal(error.message.includes(statePath()), true)
+    assert.equal(error.message.includes('EISDIR'), true)
+    return true
+  })
+  rmSync(statePath(), { recursive: true, force: true })
+
+  // 2. Simulated I/O error via custom reader
+  assert.throws(
+    () => readState(() => ({ kind: 'read_error', fsCode: 'EIO', cause: new Error('disk failure') })),
+    (error) => {
+      assert.equal(error instanceof HarnessError, true)
+      assert.equal(error.code, STATE_READ_FAILED_CODE)
+      assert.equal(error.message.includes(statePath()), true)
+      assert.equal(error.message.includes('EIO'), true)
+      return true
+    },
+  )
+
+  // 3. Unreadable file permissions (non-root)
+  if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+    const valid = JSON.stringify({ mode: 'round_robin', keys: {}, keySavedAt: {} }) + '\n'
+    writeFileSync(statePath(), valid, 'utf8')
+    chmodSync(statePath(), 0o000)
+    try {
+      assert.throws(() => readState(), (error) => {
+        assert.equal(error instanceof HarnessError, true)
+        assert.equal(error.code, STATE_READ_FAILED_CODE)
+        assert.equal(error.message.includes(statePath()), true)
+        assert.equal(error.message.includes('EACCES'), true)
+        return true
+      })
+      assert.throws(() => setEnabled(ID, false), (error) => error.code === STATE_READ_FAILED_CODE)
+    } finally {
+      chmodSync(statePath(), 0o600)
+    }
+    assert.equal(readFileSync(statePath(), 'utf8'), valid)
+  }
 })
 
 test('the round-robin cursor is not part of the shared state module', () => {
