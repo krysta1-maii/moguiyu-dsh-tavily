@@ -626,6 +626,39 @@ test('key changes preserve mode and availability', async () => {
   assert.equal(res.body.keys[1].active, true)
 })
 
+test('key changes merge state updates completed during credential writes', async () => {
+  const { routes, credentials } = install(KEYS)
+  const update = routes.get('/api/tavily-manager/update')
+  const originalSet = credentials.set.bind(credentials)
+  let markWriteStarted
+  let releaseWrite
+  const writeStarted = new Promise((resolve) => { markWriteStarted = resolve })
+  const writeGate = new Promise((resolve) => { releaseWrite = resolve })
+  let blocked = false
+  credentials.set = async (ref, value) => {
+    if (ref === 'TAVILY_API_KEYS' && !blocked) {
+      blocked = true
+      markWriteStarted()
+      await writeGate
+    }
+    await originalSet(ref, value)
+  }
+
+  const adding = callRoute(update, 'POST', { add: ['tvly-concurrent-key-0000'] })
+  await writeStarted
+  try {
+    const mode = await callRoute(update, 'POST', { mode: 'round_robin' })
+    assert.equal(mode.status, 200)
+    assert.equal(readState().mode, 'round_robin')
+  } finally {
+    releaseWrite()
+  }
+  const added = await adding
+  assert.equal(added.status, 200)
+  assert.equal(readState().mode, 'round_robin', 'late key write must not restore the preflight mode')
+  assert.equal(credentials.store.get('TAVILY_API_KEYS').includes('tvly-concurrent-key-0000'), true)
+})
+
 test('removing and re-adding a key resets its availability', async () => {
   const { routes } = install(KEYS)
   const id = keyId(KEYS[2])
@@ -825,6 +858,39 @@ test('usage cache is cleared by credential mutations, credentials/reference-upda
       await instA.dispose()
       assert.equal(instA.usageCache.size, 0)
       assert.equal(instA.listenerCount('credentials/reference-updated'), 0)
+    },
+  )
+})
+
+test('Host unload aborts in-flight usage and prevents late cache or state writes', async () => {
+  const keys = ['tvly-unload-aaaa-00000000']
+  const id = keyId(keys[0])
+  recordQuotaBlock(id, 'plan', '2026-01-01T00:00:00.000Z')
+  const inst = install(keys)
+  let upstreamSignal
+  let markStarted
+  let resolveUpstream
+  const started = new Promise((resolve) => { markStarted = resolve })
+  const upstream = new Promise((resolve) => { resolveUpstream = resolve })
+
+  await withUsageFetch(
+    (_key, init) => {
+      upstreamSignal = init.signal
+      markStarted()
+      return upstream
+    },
+    async () => {
+      const pending = callRoute(inst.routes.get('/api/tavily-usage'), 'GET')
+      await started
+      await inst.dispose()
+      const abortedAtUnload = upstreamSignal.aborted
+      resolveUpstream(usageResponse({ planUsage: 0, planLimit: 1000 }))
+      const res = await pending
+      assert.equal(res.status, 200)
+      assert.equal(abortedAtUnload, true, 'Host unload must abort the upstream request')
+      assert.equal(inst.routes.size, 0)
+      assert.equal(inst.usageCache.size, 0, 'a late response must not refill the disposed cache')
+      assert.notEqual(entryFor(readState(), id).quotaBlock, null, 'a late response must not clear quota state')
     },
   )
 })

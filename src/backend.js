@@ -144,11 +144,12 @@ function pruneUsageCache(cache, activeIds, currentTime) {
  *
  * `minFetchedAt` forces a fresh request when the cached sample predates a
  * quota block; a sample taken before the block must not clear it.
- * `signal` cancels the upstream request when the caller disconnects.
+ * `signal` cancels the upstream request when the caller disconnects or Host unloads.
  * The cache is owned by the Host install and keyed strictly by `keyId(key)`.
  */
 async function fetchUsageDetailsFor(key, { cache, id = keyId(key), minFetchedAt = 0, signal, now = Date.now } = {}) {
   const minAt = Number.isFinite(minFetchedAt) ? minFetchedAt : 0
+  if (signal?.aborted) return null
   const cached = cache.get(id)
   if (cached !== undefined) {
     if (now() - cached.at >= USAGE_TTL_MS) {
@@ -157,7 +158,6 @@ async function fetchUsageDetailsFor(key, { cache, id = keyId(key), minFetchedAt 
       return cached.details
     }
   }
-  if (signal?.aborted) return null
   const controller = new AbortController()
   const onAbort = () => controller.abort(signal.reason)
   if (signal !== undefined && signal !== null) {
@@ -171,6 +171,7 @@ async function fetchUsageDetailsFor(key, { cache, id = keyId(key), minFetchedAt 
     })
     if (!response.ok) return null
     const json = await response.json()
+    if (controller.signal.aborted) return null
     const account = json !== null && typeof json === 'object' ? json.account : undefined
     const keyInfo = json !== null && typeof json === 'object' ? json.key : undefined
     const keyUsage = metric(keyInfo?.usage)
@@ -304,11 +305,13 @@ export function warnIfNoKeys(ctx) {
 export function installBackend(ctx, options = {}) {
   const credentials = ctx.get('credentials')
   const usageCache = options.usageCache instanceof Map ? options.usageCache : new Map()
+  const hostLifetime = new AbortController()
   const now = typeof options.now === 'function' ? options.now : Date.now
 
   ctx.effect(() => () => {
+    hostLifetime.abort()
     usageCache.clear()
-  }, 'tavily-backend: usage cache')
+  }, 'tavily-backend: usage lifetime')
 
   if (typeof ctx.on === 'function') {
     ctx.effect(() => ctx.on('credentials/reference-updated', (ref) => {
@@ -392,10 +395,11 @@ export function installBackend(ctx, options = {}) {
         const { values: keys } = await collectStoredKeys(credentials)
         pruneUsageCache(usageCache, new Set(keys.map(keyId)), now())
         if (keys.length === 0) return jsonResponse(200, { ok: false, error: 'no Tavily API key configured' })
+        const requestSignal = AbortSignal.any([request.signal, hostLifetime.signal])
         const initial = readState()
         const fetched = []
         for (const key of keys) {
-          if (request.signal?.aborted) break
+          if (requestSignal.aborted) break
           const id = keyId(key)
           const entry = entryFor(initial, id)
           const blockAt = entry.quotaBlock !== null ? Date.parse(entry.quotaBlock.at) : 0
@@ -403,9 +407,10 @@ export function installBackend(ctx, options = {}) {
             cache: usageCache,
             id,
             minFetchedAt: Number.isFinite(blockAt) ? blockAt : 0,
-            signal: request.signal,
+            signal: requestSignal,
             now,
           })
+          if (requestSignal.aborted) break
           if (details !== null && entry.quotaBlock !== null) {
             const ratio = recoveryRatio(entry.quotaBlock.reason, details)
             if (ratio !== null && ratio < RECOVERY_THRESHOLD) {
@@ -531,7 +536,7 @@ export function installBackend(ctx, options = {}) {
 
         // Preflight state readability BEFORE any credential write so a corrupt
         // or unreadable state file never causes partial credential mutations.
-        const preflightState = readState()
+        readState()
 
         // A ref the launching environment supplies is inherited READ-ONLY: set and
         // unset throw for it. Decide that BEFORE writing anything. Mode and
@@ -563,9 +568,9 @@ export function installBackend(ctx, options = {}) {
             usageCache.clear()
           }
 
-          // Keep the saved dates, prune availability records for removed keys,
-          // and preserve mode/availability while replacing keySavedAt.
-          const state = preflightState
+          // Re-read after asynchronous credential writes so the preflight snapshot
+          // cannot overwrite concurrent mode, availability, or quota updates.
+          const state = readState()
           const kept = new Set(values.map(keyId))
           for (const id of Object.keys(state.keys)) {
             if (!kept.has(id)) delete state.keys[id]

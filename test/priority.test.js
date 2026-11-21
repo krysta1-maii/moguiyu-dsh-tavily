@@ -101,6 +101,39 @@ for (const status of [401, 429, 432, 433]) {
   })
 }
 
+test('retryable response bodies are cancelled before failover', async () => {
+  const keys = KEYS.slice(0, 2)
+  const { dispose, tool } = install(keys)
+  let retryResponse
+  let retryStreamCancelled = false
+  try {
+    await withFetch(
+      (key) => {
+        if (key !== keys[0]) return okResponse()
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"error":"rate limited"}'))
+          },
+          cancel() {
+            retryStreamCancelled = true
+          },
+        })
+        retryResponse = new Response(stream, { status: 429 })
+        return retryResponse
+      },
+      async (seen) => {
+        const result = await tool.execute({ query: 'release retry body' }, {})
+        assert.equal(result.results.length, 1)
+        assert.deepEqual(seen, keys)
+        assert.equal(retryResponse.bodyUsed, true)
+        assert.equal(retryStreamCancelled, true)
+      },
+    )
+  } finally {
+    dispose()
+  }
+})
+
 test('a healthy first key serves every call', async () => {
   const keys = KEYS.slice(0, 3)
   const { dispose, tool } = install(keys)

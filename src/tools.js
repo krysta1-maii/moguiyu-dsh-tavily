@@ -176,6 +176,7 @@ async function callOperation(operation, body, key, exec, timeoutMs) {
     })
     if (callerSignal?.aborted) throw callerAbortReason(callerSignal)
     if (RETRYABLE_STATUSES.has(response.status)) {
+      await response.body?.cancel().catch(() => {})
       return { kind: 'retryable', statusCode: response.status }
     }
     if (!response.ok) {
